@@ -7,13 +7,25 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AbrirEn {
     /// La rueda aparece centrada bajo el puntero.
     Cursor,
     /// La rueda aparece en el centro del monitor donde está el puntero.
     Centro,
+}
+
+/// Botón del ratón que abre la rueda al mantenerlo pulsado.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Boton {
+    /// La rueda del ratón (botón central).
+    Central,
+    /// Botón lateral "atrás" (XBUTTON1).
+    Atras,
+    /// Botón lateral "adelante" (XBUTTON2).
+    Adelante,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,6 +37,10 @@ pub struct Acceso {
     /// Argumentos opcionales, por ejemplo `/k echo hola` para `cmd.exe`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argumentos: Option<String>,
+    /// Ícono elegido a mano: `lucide:<nombre>` o `archivo:<ruta>,<índice>`. Sin él, el automático
+    /// (el de la app, el favicon de la web...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icono: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +51,17 @@ pub struct Config {
     /// corta se reenvía como clic central normal (abrir enlaces en otra pestaña, etc.).
     #[serde(default = "retardo_defecto")]
     pub retardo_ms: u32,
+    #[serde(default = "boton_defecto")]
+    pub boton: Boton,
+    /// Escala de la rueda: 1.0 es el tamaño normal.
+    #[serde(default = "tamano_defecto")]
+    pub tamano: f32,
+    /// Radio (en píxeles lógicos) del círculo central donde soltar cancela.
+    #[serde(default = "zona_defecto")]
+    pub zona_central: f32,
+    /// Oscurecer un poco la pantalla mientras la rueda está abierta.
+    #[serde(default = "si")]
+    pub oscurecer: bool,
     #[serde(default)]
     pub accesos: Vec<Acceso>,
 }
@@ -47,16 +74,57 @@ fn retardo_defecto() -> u32 {
     160
 }
 
+fn boton_defecto() -> Boton {
+    Boton::Central
+}
+
+fn tamano_defecto() -> f32 {
+    1.0
+}
+
+fn zona_defecto() -> f32 {
+    30.0
+}
+
+fn si() -> bool {
+    true
+}
+
+pub const RETARDO_MIN: u32 = 80;
+pub const RETARDO_MAX: u32 = 600;
+pub const TAMANO_MIN: f32 = 0.8;
+pub const TAMANO_MAX: f32 = 1.4;
+pub const ZONA_MIN: f32 = 20.0;
+pub const ZONA_MAX: f32 = 60.0;
+
+impl Config {
+    /// Lleva cada valor a su rango; un JSON editado a mano no puede romper la rueda.
+    pub fn normalizar(&mut self) {
+        self.retardo_ms = self.retardo_ms.clamp(RETARDO_MIN, RETARDO_MAX);
+        self.tamano = if self.tamano.is_finite() { self.tamano.clamp(TAMANO_MIN, TAMANO_MAX) } else { 1.0 };
+        self.zona_central = if self.zona_central.is_finite() {
+            self.zona_central.clamp(ZONA_MIN, ZONA_MAX)
+        } else {
+            zona_defecto()
+        };
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let acceso = |nombre: &str, destino: &str| Acceso {
             nombre: nombre.into(),
             destino: destino.into(),
             argumentos: None,
+            icono: None,
         };
         Config {
             abrir_en: abrir_en_defecto(),
             retardo_ms: retardo_defecto(),
+            boton: boton_defecto(),
+            tamano: tamano_defecto(),
+            zona_central: zona_defecto(),
+            oscurecer: true,
             accesos: vec![
                 acceso("Explorador", "explorer.exe"),
                 acceso("Navegador", "https://www.google.com"),
@@ -81,7 +149,7 @@ pub fn cargar() -> Config {
     match std::fs::read_to_string(&ruta) {
         Ok(texto) => match serde_json::from_str::<Config>(&texto) {
             Ok(mut cfg) => {
-                cfg.retardo_ms = cfg.retardo_ms.clamp(50, 1000);
+                cfg.normalizar();
                 cfg
             }
             Err(e) => {
@@ -160,5 +228,18 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"accesos":[]}"#).unwrap();
         assert_eq!(cfg.abrir_en, AbrirEn::Cursor);
         assert_eq!(cfg.retardo_ms, 160);
+        assert_eq!(cfg.boton, Boton::Central);
+        assert!(cfg.oscurecer);
+        assert_eq!(cfg.tamano, 1.0);
+    }
+
+    #[test]
+    fn normalizar_lleva_los_valores_a_su_rango() {
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"retardo_ms":5,"tamano":9.0,"zona_central":-3,"accesos":[]}"#).unwrap();
+        cfg.normalizar();
+        assert_eq!(cfg.retardo_ms, RETARDO_MIN);
+        assert_eq!(cfg.tamano, TAMANO_MAX);
+        assert_eq!(cfg.zona_central, ZONA_MIN);
     }
 }

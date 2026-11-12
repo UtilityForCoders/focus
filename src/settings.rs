@@ -1,107 +1,284 @@
-//! Ventana de configuración: elegir qué apps van en la rueda sin tocar `config.json` a mano.
+//! Ventana de ajustes, dibujada entera con Direct2D sobre un fondo acrílico translúcido.
 //!
-//! A la izquierda, todas las apps instaladas (las del menú Inicio, también las de la Store) con su
-//! ícono y un buscador. A la derecha, los accesos de la rueda en orden, con un formulario para
-//! renombrarlos o crear accesos propios (carpetas, URLs, comandos). Cada cambio se guarda al
-//! momento y la rueda lo usa en la siguiente pulsación.
+//! A la izquierda, una barra con las secciones; a la derecha, filas con título, descripción y
+//! un control (interruptor, selector segmentado o deslizador). En "Accesos", todas las apps
+//! instaladas con su ícono y buscador, y la lista de la rueda con su editor.
 //!
-//! Son controles nativos de Windows (ListView, Edit, Button) con el estilo moderno que activa el
-//! manifiesto. Los íconos salen de la lista de imágenes del sistema, que ya está cargada.
+//! **Cómo está hecha.** Es una interfaz de modo inmediato: cada `WM_PAINT` dibuja todo desde el
+//! estado y, de paso, apunta en `zonas` qué rectángulo hace qué. El ratón se resuelve contra esas
+//! zonas. No hay controles nativos: los de Windows no se pueden pintar sobre el fondo acrílico
+//! (GDI escribe alfa 0 y el texto sale transparente), así que los campos de texto también son
+//! propios, con cursor, borrar, flechas, Inicio/Fin, Ctrl+A y Ctrl+V.
 //!
-//! Sobre el estado: los controles notifican de forma síncrona (`WM_NOTIFY`, `EN_CHANGE`) mientras
-//! el propio código les envía mensajes. El estado vive en un `RefCell` y el procedimiento de
-//! ventana usa `try_borrow_mut`: si ya está prestado, la notificación la provocó el propio código
-//! (llenar una lista, escribir en un campo) y se ignora, que es justo lo que se quiere.
+//! Las coordenadas son DIP (píxeles lógicos): el render target lleva el DPI de la ventana y el
+//! ratón se divide por la escala al entrar.
+//!
+//! Sobre el estado: vive en un `RefCell`. Los diálogos modales (Examinar) y abrir archivos se
+//! hacen con el estado devuelto, porque tienen su propio bucle de mensajes.
 
 use crate::apps::{self, AppInstalada};
-use crate::config::{self, AbrirEn, Acceso, Config};
-use crate::icons;
+use crate::autostart;
+use crate::config::{self, AbrirEn, Acceso, Boton, Config};
+use crate::icons::{self, Icono, IconoRef};
+use crate::lucide;
+use std::collections::HashMap;
+use std::sync::Arc;
+use crate::launch;
+use crate::render::{self, Escena};
+use crate::ui::{dentro, glifo, rect, rgba, tema, Alin, Color, Peso, Pintor, Rect};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::core::{w, HSTRING, PCWSTR, PWSTR};
+use windows::core::{w, Interface, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Direct2D::Common::*;
+use windows::Win32::Graphics::Direct2D::*;
+use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::Graphics::Dwm::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_LEFT};
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Controls::Dialogs::*;
-use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Avisa a la ventana principal de que la configuración cambió (para precargar íconos).
 pub const WM_FOCUS_CONFIG: u32 = WM_APP + 20;
 const WM_APPS_LISTA: u32 = WM_APP + 30;
 const WM_APPS_ICONOS: u32 = WM_APP + 31;
+const TIMER_CURSOR: usize = 1;
 
-const ID_BUSCAR: i32 = 101;
-const ID_APPS: i32 = 102;
-const ID_AGREGAR: i32 = 103;
-const ID_RECARGAR: i32 = 104;
-const ID_ACCESOS: i32 = 201;
-const ID_SUBIR: i32 = 202;
-const ID_BAJAR: i32 = 203;
-const ID_QUITAR: i32 = 204;
-const ID_NOMBRE: i32 = 210;
-const ID_DESTINO: i32 = 211;
-const ID_EXAMINAR: i32 = 212;
-const ID_ARGS: i32 = 213;
-const ID_APLICAR: i32 = 214;
-const ID_NUEVO: i32 = 215;
-const ID_ABRIR_EN: i32 = 220;
-const ID_RETARDO: i32 = 221;
-
-/// Más accesos que estos y los textos de la rueda empiezan a no caber.
+const ANCHO_LATERAL: f32 = 212.0;
+const FILA_APP: f32 = 40.0;
+const FILA_ACCESO: f32 = 44.0;
+/// Más accesos que estos y la rueda empieza a quedar apretada.
 const RECOMENDADO: usize = 10;
 
 static VENTANA: AtomicIsize = AtomicIsize::new(0);
 
-/// La ventana de configuración, si está abierta (para `IsDialogMessageW` en el bucle principal).
-pub fn ventana() -> Option<HWND> {
-    let v = VENTANA.load(Ordering::Relaxed);
-    (v != 0).then_some(HWND(v as *mut _))
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seccion {
+    General,
+    Activacion,
+    Apariencia,
+    Accesos,
+    Acerca,
 }
 
-struct Controles {
-    titulo_apps: HWND,
-    titulo_accesos: HWND,
-    buscar: HWND,
-    recargar: HWND,
-    apps: HWND,
-    agregar: HWND,
-    accesos: HWND,
-    subir: HWND,
-    bajar: HWND,
-    quitar: HWND,
-    contador: HWND,
-    et_nombre: HWND,
-    nombre: HWND,
-    et_destino: HWND,
-    destino: HWND,
-    examinar: HWND,
-    et_args: HWND,
-    args: HWND,
-    aplicar: HWND,
-    nuevo: HWND,
-    et_abrir_en: HWND,
-    abrir_en: HWND,
-    et_retardo: HWND,
-    retardo: HWND,
+const SECCIONES: [(Seccion, char, &str); 5] = [
+    (Seccion::General, glifo::AJUSTES, "General"),
+    (Seccion::Activacion, glifo::RATON, "Activación"),
+    (Seccion::Apariencia, glifo::COLOR, "Apariencia"),
+    (Seccion::Accesos, glifo::APPS, "Accesos"),
+    (Seccion::Acerca, glifo::INFO, "Acerca de"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CampoId {
+    Buscar = 0,
+    Nombre = 1,
+    Destino = 2,
+    Args = 3,
+    BuscarIcono = 4,
+    Archivo = 5,
+}
+
+/// Pestañas del selector de íconos.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModoSel {
+    Lucide,
+    Archivo,
+}
+
+/// Archivo que se abre por defecto en la pestaña "Archivo": tiene más de 300 íconos.
+const ARCHIVO_ICONOS: &str = "%SystemRoot%\\System32\\shell32.dll";
+const CELDA: f32 = 52.0;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Desliz {
+    Retardo,
+    Tamano,
+    Zona,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Accion {
+    Seccion(Seccion),
+    AbrirEn(AbrirEn),
+    Boton(Boton),
+    Deslizador(Desliz),
+    InicioWindows,
+    Oscurecer,
+    Campo(CampoId),
+    AgregarApp(usize),
+    Elegir(usize),
+    Subir(usize),
+    Bajar(usize),
+    Quitar(usize),
+    Examinar,
+    Guardar,
+    Nuevo,
+    Recargar,
+    AbrirConfig,
+    AbrirCarpeta,
+    AbrirSelector,
+    CerrarSelector,
+    /// Zona que solo tapa lo de debajo (el panel del selector).
+    Bloqueo,
+    IconoAuto,
+    ModoSelector(ModoSel),
+    ElegirLucide(usize),
+    ElegirArchivo(i32),
+    ExaminarIconos,
+}
+
+/// Lo que hay que hacer después de soltar el estado (diálogos con su propio bucle de mensajes).
+enum Diferida {
+    Examinar,
+    ExaminarIconos,
+    Abrir(Acceso),
+}
+
+// ─── Campo de texto ─────────────────────────────────────────────────────────────────────────
+
+/// Texto editable de una línea. El cursor cuenta caracteres, no bytes.
+#[derive(Default, Clone)]
+struct Campo {
+    texto: String,
+    cursor: usize,
+    /// Ctrl+A: lo próximo que se escriba reemplaza todo.
+    todo: bool,
+}
+
+impl Campo {
+    fn largo(&self) -> usize {
+        self.texto.chars().count()
+    }
+
+    fn byte(&self, c: usize) -> usize {
+        self.texto.char_indices().nth(c).map(|(i, _)| i).unwrap_or(self.texto.len())
+    }
+
+    /// Posición del cursor en unidades UTF-16 (lo que mide DirectWrite).
+    fn cursor_utf16(&self) -> usize {
+        self.texto.chars().take(self.cursor).map(char::len_utf16).sum()
+    }
+
+    fn poner(&mut self, s: &str) {
+        self.texto = s.to_string();
+        self.cursor = self.largo();
+        self.todo = false;
+    }
+
+    fn quitar_seleccion(&mut self) -> bool {
+        if self.todo {
+            self.texto.clear();
+            self.cursor = 0;
+            self.todo = false;
+            return true;
+        }
+        false
+    }
+
+    fn insertar(&mut self, s: &str) {
+        self.quitar_seleccion();
+        // Una sola línea: los saltos de un texto pegado se vuelven espacios.
+        let limpio: String = s.chars().map(|c| if c == '\r' || c == '\n' || c == '\t' { ' ' } else { c }).collect();
+        let b = self.byte(self.cursor);
+        self.texto.insert_str(b, &limpio);
+        self.cursor += limpio.chars().count();
+    }
+
+    fn borrar_atras(&mut self) {
+        if self.quitar_seleccion() || self.cursor == 0 {
+            return;
+        }
+        let b = self.byte(self.cursor - 1);
+        self.texto.remove(b);
+        self.cursor -= 1;
+    }
+
+    fn borrar_delante(&mut self) {
+        if self.quitar_seleccion() || self.cursor >= self.largo() {
+            return;
+        }
+        let b = self.byte(self.cursor);
+        self.texto.remove(b);
+    }
+
+    fn mover(&mut self, delta: isize) {
+        self.todo = false;
+        self.cursor = (self.cursor as isize + delta).clamp(0, self.largo() as isize) as usize;
+    }
+
+    fn ir(&mut self, posicion: usize) {
+        self.todo = false;
+        self.cursor = posicion.min(self.largo());
+    }
+}
+
+// ─── Estado ─────────────────────────────────────────────────────────────────────────────────
+
+struct Zona {
+    r: Rect,
+    accion: Accion,
 }
 
 struct Ajustes {
     hwnd: HWND,
     principal: HWND,
+    factory: ID2D1Factory,
+    dwrite: IDWriteFactory,
+    rt: Option<ID2D1HwndRenderTarget>,
+    pintor: Option<Pintor>,
+    /// El fondo acrílico está activo (Windows 11). Si no, se pinta un fondo opaco.
+    vidrio: bool,
+    escala: f32,
+
+    seccion: Seccion,
     cfg: Config,
+    inicio_windows: bool,
+
     apps: Vec<AppInstalada>,
     cargando: bool,
-    /// Fila de la lista de apps → posición en `apps`. Siempre en orden creciente.
+    /// Posiciones en `apps` que pasan el filtro de búsqueda, en orden.
     filtradas: Vec<usize>,
-    c: Controles,
-    fuente: HFONT,
-    fuente_titulo: HFONT,
-    icono_generico: i32,
+
+    campos: [Campo; 6],
+    foco: Option<CampoId>,
+    cursor_visible: bool,
+    /// Primera mitad de un carácter fuera del plano básico (WM_CHAR llega en dos partes).
+    sustituto: Option<u16>,
+    seleccion: Option<usize>,
+    /// Ícono elegido en el editor (`lucide:...` o `archivo:...`); `None` es el automático.
+    icono_editor: Option<String>,
+
+    selector: Option<ModoSel>,
+    scroll_sel: f32,
+    max_sel: f32,
+    area_sel: Rect,
+    lucide_filtrados: Vec<usize>,
+    archivo_cantidad: u32,
+    iconos_archivo: HashMap<(String, i32), Option<IconoRef>>,
+
+    zonas: Vec<Zona>,
+    raton: (f32, f32),
+    hover: Option<Accion>,
+    pulsada: Option<Accion>,
+    arrastre: Option<Desliz>,
+    pistas: Vec<(Desliz, Rect)>,
+    campos_r: Vec<(CampoId, Rect, f32)>,
+
+    scroll_apps: f32,
+    scroll_accesos: f32,
+    area_apps: Rect,
+    area_accesos: Rect,
+    max_apps: f32,
+    max_accesos: f32,
 }
 
 thread_local! {
@@ -115,128 +292,39 @@ fn con_ajustes<R>(f: impl FnOnce(&mut Ajustes) -> R) -> Option<R> {
     })
 }
 
-fn escala(hwnd: HWND) -> f32 {
-    unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
-}
-
-// ─── Utilidades de controles ────────────────────────────────────────────────────────────────
-
-fn enviar(h: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
-    unsafe { SendMessageW(h, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam))).0 }
-}
-
-fn leer(h: HWND) -> String {
-    unsafe {
-        let n = GetWindowTextLengthW(h);
-        let mut buf = vec![0u16; n as usize + 1];
-        let leidos = GetWindowTextW(h, &mut buf);
-        String::from_utf16_lossy(&buf[..leidos as usize])
-    }
-}
-
-fn escribir(h: HWND, texto: &str) {
-    unsafe {
-        let _ = SetWindowTextW(h, &HSTRING::from(texto));
-    }
-}
-
-fn lv_vaciar(lv: HWND) {
-    enviar(lv, LVM_DELETEALLITEMS, 0, 0);
-}
-
-fn lv_insertar(lv: HWND, fila: i32, texto: &str, imagen: i32) {
-    let mut buf: Vec<u16> = texto.encode_utf16().chain(std::iter::once(0)).collect();
-    let item = LVITEMW {
-        mask: LVIF_TEXT | LVIF_IMAGE,
-        iItem: fila,
-        pszText: PWSTR(buf.as_mut_ptr()),
-        iImage: imagen,
-        ..Default::default()
-    };
-    enviar(lv, LVM_INSERTITEMW, 0, &item as *const _ as isize);
-}
-
-fn lv_imagen(lv: HWND, fila: i32, imagen: i32) {
-    let item = LVITEMW { mask: LVIF_IMAGE, iItem: fila, iImage: imagen, ..Default::default() };
-    enviar(lv, LVM_SETITEMW, 0, &item as *const _ as isize);
-}
-
-fn lv_seleccionadas(lv: HWND) -> Vec<usize> {
-    let mut filas = Vec::new();
-    let mut i = -1isize;
-    loop {
-        i = enviar(lv, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
-        if i < 0 {
-            break;
-        }
-        filas.push(i as usize);
-    }
-    filas
-}
-
-fn lv_seleccionar(lv: HWND, fila: Option<usize>) {
-    let ninguna = LVITEMW { stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0), ..Default::default() };
-    enviar(lv, LVM_SETITEMSTATE, usize::MAX, &ninguna as *const _ as isize);
-    if let Some(f) = fila {
-        let item = LVITEMW {
-            stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
-            state: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
-            ..Default::default()
-        };
-        enviar(lv, LVM_SETITEMSTATE, f, &item as *const _ as isize);
-        enviar(lv, LVM_ENSUREVISIBLE, f, 0);
-    }
-}
-
-/// La única columna ocupa el ancho útil de la lista. Se repite después de llenarla, porque la
-/// barra vertical aparece (y le quita ancho) solo cuando hay más filas de las que caben; si no,
-/// sale una barra horizontal que no hace falta.
-fn ajustar_columna(lv: HWND) {
-    let mut cr = RECT::default();
-    unsafe {
-        let _ = GetClientRect(lv, &mut cr);
-    }
-    enviar(lv, LVM_SETCOLUMNWIDTH, 0, cr.right as isize);
-}
-
-fn redibujo(h: HWND, activo: bool) {
-    enviar(h, WM_SETREDRAW, activo as usize, 0);
-    if activo {
-        unsafe {
-            let _ = InvalidateRect(Some(h), None, true);
-        }
-    }
-}
-
-// ─── Apertura ───────────────────────────────────────────────────────────────────────────────
-
 /// Abre la ventana, o la trae al frente si ya estaba abierta.
 pub fn abrir(principal: HWND) {
-    if let Some(h) = ventana() {
+    let v = VENTANA.load(Ordering::Relaxed);
+    if v != 0 {
         unsafe {
+            let h = HWND(v as *mut _);
             let _ = ShowWindow(h, SW_RESTORE);
             let _ = SetForegroundWindow(h);
         }
         return;
     }
     if let Err(e) = crear(principal) {
-        eprintln!("no se pudo abrir la configuración: {e}");
+        eprintln!("no se pudo abrir los ajustes: {e}");
     }
+}
+
+/// Repinta la ventana si está abierta (por ejemplo, porque llegó un favicon).
+pub fn refrescar() {
+    con_ajustes(|a| a.invalidar());
 }
 
 fn crear(principal: HWND) -> windows::core::Result<()> {
     unsafe {
         let instancia: HINSTANCE = GetModuleHandleW(None)?.into();
         let clase = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: instancia,
             lpszClassName: w!("FocusAjustes"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hIcon: LoadIconW(None, IDI_APPLICATION)?,
-            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
             ..Default::default()
         };
-        // Falla si ya estaba registrada (segunda apertura), y no pasa nada.
         RegisterClassW(&clase);
 
         // Tamaño inicial según el DPI del monitor donde está el puntero, centrado en él.
@@ -249,14 +337,14 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
         let s = dx as f32 / 96.0;
         let t = info.rcWork;
-        let (an, al) = (((980.0 * s) as i32).min(t.right - t.left), ((680.0 * s) as i32).min(t.bottom - t.top));
+        let (an, al) = (((1000.0 * s) as i32).min(t.right - t.left), ((680.0 * s) as i32).min(t.bottom - t.top));
         let (x, y) = (t.left + (t.right - t.left - an) / 2, t.top + (t.bottom - t.top - al) / 2);
 
         let hwnd = CreateWindowExW(
-            WS_EX_CONTROLPARENT,
+            WINDOW_EX_STYLE(0),
             w!("FocusAjustes"),
-            w!("Focus · Accesos de la rueda"),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            w!("Focus"),
+            WS_OVERLAPPEDWINDOW,
             x,
             y,
             an,
@@ -267,94 +355,58 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
             None,
         )?;
 
-        let control = |clase: PCWSTR, texto: &str, estilo: u32, ex: WINDOW_EX_STYLE, id: i32| -> HWND {
-            CreateWindowExW(
-                ex,
-                clase,
-                &HSTRING::from(texto),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(estilo),
-                0,
-                0,
-                0,
-                0,
-                Some(hwnd),
-                Some(HMENU(id as isize as *mut _)),
-                Some(instancia),
-                None,
-            )
-            .unwrap_or_default()
-        };
-        let etiqueta = |texto: &str| control(w!("STATIC"), texto, SS_LEFT.0 | SS_CENTERIMAGE.0, WINDOW_EX_STYLE(0), -1);
-        let boton = |texto: &str, id: i32| control(w!("BUTTON"), texto, WS_TABSTOP.0 | BS_PUSHBUTTON as u32, WINDOW_EX_STYLE(0), id);
-        let campo = |id: i32, extra: u32| {
-            control(w!("EDIT"), "", WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | extra, WS_EX_CLIENTEDGE, id)
-        };
-        let lista = |id: i32, extra: u32| {
-            let lv = control(
-                WC_LISTVIEWW,
-                "",
-                WS_TABSTOP.0 | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS | extra,
-                WS_EX_CLIENTEDGE,
-                id,
-            );
-            enviar(lv, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
-            let _ = SetWindowTheme(lv, w!("Explorer"), None);
-            enviar(lv, LVM_SETIMAGELIST, LVSIL_SMALL as usize, icons::lista_sistema().0);
-            let col = LVCOLUMNW { mask: LVCF_WIDTH, cx: 200, ..Default::default() };
-            enviar(lv, LVM_INSERTCOLUMNW, 0, &col as *const _ as isize);
-            lv
-        };
+        // Barra de título oscura y fondo acrílico. En Windows 10 el fondo falla y se usa uno opaco.
+        let oscuro = BOOL(1);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &oscuro as *const _ as *const _, 4);
+        let fondo = DWMSBT_TRANSIENTWINDOW;
+        let vidrio = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &fondo as *const _ as *const _, 4).is_ok()
+            && DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 }).is_ok();
 
-        let c = Controles {
-            titulo_apps: etiqueta("Aplicaciones instaladas"),
-            titulo_accesos: etiqueta("Accesos en la rueda"),
-            buscar: campo(ID_BUSCAR, 0),
-            recargar: boton("Recargar", ID_RECARGAR),
-            apps: lista(ID_APPS, 0),
-            agregar: boton("Agregar a la rueda  \u{2192}", ID_AGREGAR),
-            accesos: lista(ID_ACCESOS, LVS_SINGLESEL),
-            subir: boton("Subir", ID_SUBIR),
-            bajar: boton("Bajar", ID_BAJAR),
-            quitar: boton("Quitar", ID_QUITAR),
-            contador: etiqueta(""),
-            et_nombre: etiqueta("Nombre"),
-            nombre: campo(ID_NOMBRE, 0),
-            et_destino: etiqueta("Destino"),
-            destino: campo(ID_DESTINO, 0),
-            examinar: boton("Examinar…", ID_EXAMINAR),
-            et_args: etiqueta("Argumentos"),
-            args: campo(ID_ARGS, 0),
-            aplicar: boton("Guardar cambios", ID_APLICAR),
-            nuevo: boton("Agregar como nuevo", ID_NUEVO),
-            et_abrir_en: etiqueta("Abrir la rueda"),
-            abrir_en: control(w!("COMBOBOX"), "", WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0, WINDOW_EX_STYLE(0), ID_ABRIR_EN),
-            et_retardo: etiqueta("Retardo (ms)"),
-            retardo: campo(ID_RETARDO, ES_NUMBER as u32),
-        };
-
-        enviar(c.buscar, EM_SETCUEBANNER, 1, w!("Buscar aplicación…").0 as isize);
-        enviar(c.destino, EM_SETCUEBANNER, 1, w!("Programa, carpeta, archivo, URL o ms-settings:").0 as isize);
-        enviar(c.args, EM_SETCUEBANNER, 1, w!("Opcional").0 as isize);
-        enviar(c.abrir_en, CB_ADDSTRING, 0, w!("Bajo el puntero").0 as isize);
-        enviar(c.abrir_en, CB_ADDSTRING, 0, w!("En el centro del monitor").0 as isize);
-
+        let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+        let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
         let mut a = Ajustes {
             hwnd,
             principal,
+            factory,
+            dwrite,
+            rt: None,
+            pintor: None,
+            vidrio,
+            escala: GetDpiForWindow(hwnd).max(96) as f32 / 96.0,
+            seccion: Seccion::Accesos,
             cfg: config::cargar(),
+            inicio_windows: autostart::activo(),
             apps: Vec::new(),
             cargando: true,
             filtradas: Vec::new(),
-            c,
-            fuente: HFONT::default(),
-            fuente_titulo: HFONT::default(),
-            icono_generico: icons::indice(""),
+            campos: Default::default(),
+            foco: None,
+            cursor_visible: true,
+            sustituto: None,
+            seleccion: None,
+            icono_editor: None,
+            selector: None,
+            scroll_sel: 0.0,
+            max_sel: 0.0,
+            area_sel: rect(0.0, 0.0, 0.0, 0.0),
+            lucide_filtrados: lucide::buscar(""),
+            archivo_cantidad: 0,
+            iconos_archivo: HashMap::new(),
+            zonas: Vec::new(),
+            raton: (-1.0, -1.0),
+            hover: None,
+            pulsada: None,
+            arrastre: None,
+            pistas: Vec::new(),
+            campos_r: Vec::new(),
+            scroll_apps: 0.0,
+            scroll_accesos: 0.0,
+            area_apps: rect(0.0, 0.0, 0.0, 0.0),
+            area_accesos: rect(0.0, 0.0, 0.0, 0.0),
+            max_apps: 0.0,
+            max_accesos: 0.0,
         };
-        a.fuentes();
-        a.distribuir();
-        a.mostrar_opciones();
-        a.llenar_accesos(None);
-
+        a.campo(CampoId::Archivo).poner(ARCHIVO_ICONOS);
         match apps::en_cache() {
             Some(lista) => {
                 a.apps = lista;
@@ -366,140 +418,20 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
 
         AJUSTES.with(|s| *s.borrow_mut() = Some(a));
         VENTANA.store(hwnd.0 as isize, Ordering::Relaxed);
+        SetTimer(Some(hwnd), TIMER_CURSOR, 530, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
-        if let Some(b) = con_ajustes(|a| a.c.buscar) {
-            let _ = SetFocus(Some(b));
-        }
     }
     Ok(())
 }
 
-// ─── Estado y acciones ──────────────────────────────────────────────────────────────────────
+// ─── Acciones ───────────────────────────────────────────────────────────────────────────────
 
 impl Ajustes {
-    fn todos(&self) -> Vec<HWND> {
-        let c = &self.c;
-        vec![
-            c.titulo_apps, c.titulo_accesos, c.buscar, c.recargar, c.apps, c.agregar, c.accesos, c.subir,
-            c.bajar, c.quitar, c.contador, c.et_nombre, c.nombre, c.et_destino, c.destino, c.examinar,
-            c.et_args, c.args, c.aplicar, c.nuevo, c.et_abrir_en, c.abrir_en, c.et_retardo, c.retardo,
-        ]
-    }
-
-    /// Fuente del sistema para mensajes (Segoe UI), al tamaño del DPI actual.
-    fn fuentes(&mut self) {
+    fn invalidar(&self) {
         unsafe {
-            let dpi = GetDpiForWindow(self.hwnd).max(96);
-            let mut m = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
-            let _ = SystemParametersInfoForDpi(
-                SPI_GETNONCLIENTMETRICS.0,
-                m.cbSize,
-                Some(&mut m as *mut _ as *mut _),
-                0,
-                dpi,
-            );
-            let normal = CreateFontIndirectW(&m.lfMessageFont);
-            let mut lf = m.lfMessageFont;
-            lf.lfWeight = 600;
-            lf.lfHeight = (lf.lfHeight as f32 * 1.15) as i32;
-            let titulo = CreateFontIndirectW(&lf);
-            for h in self.todos() {
-                enviar(h, WM_SETFONT, normal.0 as usize, 0);
-            }
-            enviar(self.c.titulo_apps, WM_SETFONT, titulo.0 as usize, 0);
-            enviar(self.c.titulo_accesos, WM_SETFONT, titulo.0 as usize, 0);
-            for viejo in [self.fuente, self.fuente_titulo] {
-                if !viejo.is_invalid() {
-                    let _ = DeleteObject(viejo.into());
-                }
-            }
-            self.fuente = normal;
-            self.fuente_titulo = titulo;
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
-    }
-
-    /// Coloca los controles según el tamaño de la ventana. Dos columnas iguales.
-    fn distribuir(&self) {
-        let s = escala(self.hwnd);
-        let px = |v: f32| (v * s).round() as i32;
-        let mut r = RECT::default();
-        unsafe {
-            let _ = GetClientRect(self.hwnd, &mut r);
-        }
-        let (an, al) = (r.right, r.bottom);
-        let (m, sep, fila) = (px(16.0), px(8.0), px(30.0));
-        let paso = fila + sep;
-        let col = (an - 3 * m) / 2;
-        let (xi, xd) = (m, 2 * m + col);
-        let y_titulo = m;
-        let y_arriba = y_titulo + px(26.0) + sep;
-        let et = px(96.0);
-
-        let mover = |h: HWND, x: i32, y: i32, w: i32, alto: i32| unsafe {
-            let _ = MoveWindow(h, x, y, w.max(0), alto.max(0), false);
-        };
-        let c = &self.c;
-
-        // Columna izquierda: buscador, lista de apps y botón para agregar.
-        mover(c.titulo_apps, xi, y_titulo, col, px(26.0));
-        let w_recargar = px(96.0);
-        mover(c.buscar, xi, y_arriba, col - w_recargar - sep, fila);
-        mover(c.recargar, xi + col - w_recargar, y_arriba, w_recargar, fila);
-        let y_lista = y_arriba + paso;
-        mover(c.apps, xi, y_lista, col, al - m - paso - y_lista);
-        mover(c.agregar, xi, al - m - fila, col, fila);
-
-        // Columna derecha: accesos, botones de orden y el formulario.
-        mover(c.titulo_accesos, xd, y_titulo, col, px(26.0));
-        let y_form = al - m - 6 * paso + sep;
-        mover(c.accesos, xd, y_arriba, col, y_form - sep - y_arriba);
-
-        let wb = px(88.0);
-        mover(c.subir, xd, y_form, wb, fila);
-        mover(c.bajar, xd + wb + sep, y_form, wb, fila);
-        mover(c.quitar, xd + 2 * (wb + sep), y_form, wb, fila);
-        let x_cont = xd + 3 * (wb + sep);
-        mover(c.contador, x_cont, y_form, xd + col - x_cont, fila);
-
-        let x_campo = xd + et;
-        let w_campo = col - et;
-        let y1 = y_form + paso;
-        mover(c.et_nombre, xd, y1, et, fila);
-        mover(c.nombre, x_campo, y1, w_campo, fila);
-        let y2 = y1 + paso;
-        let w_examinar = px(100.0);
-        mover(c.et_destino, xd, y2, et, fila);
-        mover(c.destino, x_campo, y2, w_campo - w_examinar - sep, fila);
-        mover(c.examinar, xd + col - w_examinar, y2, w_examinar, fila);
-        let y3 = y2 + paso;
-        mover(c.et_args, xd, y3, et, fila);
-        mover(c.args, x_campo, y3, w_campo, fila);
-        let y4 = y3 + paso;
-        let w_accion = (w_campo - sep) / 2;
-        mover(c.aplicar, x_campo, y4, w_accion, fila);
-        mover(c.nuevo, x_campo + w_accion + sep, y4, w_accion, fila);
-        let y5 = y4 + paso;
-        mover(c.et_abrir_en, xd, y5, et, fila);
-        let w_combo = px(200.0);
-        // La altura del combo incluye la lista desplegable.
-        mover(c.abrir_en, x_campo, y5, w_combo, px(200.0));
-        let x_ret = x_campo + w_combo + 2 * sep;
-        let w_et_ret = px(92.0);
-        mover(c.et_retardo, x_ret, y5, w_et_ret, fila);
-        mover(c.retardo, x_ret + w_et_ret, y5, (xd + col - x_ret - w_et_ret).min(px(80.0)), fila);
-
-        ajustar_columna(c.apps);
-        ajustar_columna(c.accesos);
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, true);
-        }
-    }
-
-    fn mostrar_opciones(&self) {
-        let i = if self.cfg.abrir_en == AbrirEn::Centro { 1 } else { 0 };
-        enviar(self.c.abrir_en, CB_SETCURSEL, i, 0);
-        escribir(self.c.retardo, &self.cfg.retardo_ms.to_string());
     }
 
     fn guardar(&self) {
@@ -511,194 +443,1020 @@ impl Ajustes {
         }
     }
 
+    fn campo(&mut self, id: CampoId) -> &mut Campo {
+        &mut self.campos[id as usize]
+    }
+
     fn filtrar(&mut self) {
-        let lv = self.c.apps;
-        redibujo(lv, false);
-        lv_vaciar(lv);
-        if self.cargando {
-            self.filtradas.clear();
-            lv_insertar(lv, 0, "Cargando aplicaciones…", -1);
-        } else {
-            let q = leer(self.c.buscar);
-            self.filtradas = (0..self.apps.len()).filter(|&i| apps::coincide(&self.apps[i], &q)).collect();
-            for (fila, &i) in self.filtradas.iter().enumerate() {
-                let app = &self.apps[i];
-                let img = if app.icono >= 0 { app.icono } else { self.icono_generico };
-                lv_insertar(lv, fila as i32, &app.nombre, img);
-            }
-            if !self.filtradas.is_empty() && !q.trim().is_empty() {
-                lv_seleccionar(lv, Some(0));
-            }
-        }
-        ajustar_columna(lv);
-        redibujo(lv, true);
+        let q = self.campos[CampoId::Buscar as usize].texto.clone();
+        self.filtradas = (0..self.apps.len()).filter(|&i| apps::coincide(&self.apps[i], &q)).collect();
+        self.scroll_apps = 0.0;
     }
 
-    fn recibir_iconos(&mut self, tanda: Vec<(usize, i32)>) {
-        for (i, icono) in tanda {
-            if let Some(app) = self.apps.get_mut(i) {
-                app.icono = icono;
-            }
-            if let Ok(fila) = self.filtradas.binary_search(&i) {
-                lv_imagen(self.c.apps, fila as i32, if icono >= 0 { icono } else { self.icono_generico });
-            }
-        }
+    fn en_rueda(&self, destino: &str) -> bool {
+        self.cfg.accesos.iter().any(|a| a.destino == destino)
     }
 
-    fn llenar_accesos(&mut self, seleccion: Option<usize>) {
-        let lv = self.c.accesos;
-        redibujo(lv, false);
-        lv_vaciar(lv);
-        for (fila, a) in self.cfg.accesos.iter().enumerate() {
-            lv_insertar(lv, fila as i32, &a.nombre, icons::indice(&a.destino));
-        }
-        let seleccion = seleccion.filter(|&s| s < self.cfg.accesos.len());
-        lv_seleccionar(lv, seleccion);
-        ajustar_columna(lv);
-        redibujo(lv, true);
-        self.mostrar_formulario(seleccion);
-
-        let n = self.cfg.accesos.len();
-        let texto = match n {
-            0 => "Sin accesos todavía".to_string(),
-            1 => "1 acceso".to_string(),
-            n if n > RECOMENDADO => format!("{n} accesos · se recomiendan hasta {RECOMENDADO}"),
-            n => format!("{n} accesos"),
+    fn elegir(&mut self, i: Option<usize>) {
+        self.seleccion = i.filter(|&i| i < self.cfg.accesos.len());
+        let (n, d, a) = match self.seleccion.map(|i| &self.cfg.accesos[i]) {
+            Some(x) => (x.nombre.clone(), x.destino.clone(), x.argumentos.clone().unwrap_or_default()),
+            None => Default::default(),
         };
-        escribir(self.c.contador, &texto);
+        self.icono_editor = self.seleccion.and_then(|i| self.cfg.accesos[i].icono.clone());
+        self.campo(CampoId::Nombre).poner(&n);
+        self.campo(CampoId::Destino).poner(&d);
+        self.campo(CampoId::Args).poner(&a);
     }
 
-    fn mostrar_formulario(&self, fila: Option<usize>) {
-        let (nombre, destino, args) = match fila.and_then(|f| self.cfg.accesos.get(f)) {
-            Some(a) => (a.nombre.as_str(), a.destino.as_str(), a.argumentos.as_deref().unwrap_or("")),
-            None => ("", "", ""),
-        };
-        escribir(self.c.nombre, nombre);
-        escribir(self.c.destino, destino);
-        escribir(self.c.args, args);
-    }
-
-    fn seleccion_accesos(&self) -> Option<usize> {
-        lv_seleccionadas(self.c.accesos).first().copied()
-    }
-
-    /// Agrega las apps seleccionadas a la izquierda (o la primera de la búsqueda, si no hay
-    /// ninguna seleccionada). Las que ya están en la rueda no se repiten.
-    fn agregar_apps(&mut self) {
-        let mut filas = lv_seleccionadas(self.c.apps);
-        if filas.is_empty() && !self.filtradas.is_empty() {
-            filas.push(0);
-        }
-        let mut ultima = None;
-        for fila in filas {
-            let Some(app) = self.filtradas.get(fila).and_then(|&i| self.apps.get(i)) else { continue };
-            match self.cfg.accesos.iter().position(|a| a.destino == app.destino) {
-                Some(ya) => ultima = Some(ya),
-                None => {
-                    self.cfg.accesos.push(Acceso { nombre: app.nombre.clone(), destino: app.destino.clone(), argumentos: None });
-                    ultima = Some(self.cfg.accesos.len() - 1);
-                }
-            }
-        }
-        if ultima.is_some() {
+    /// Cambia el ícono del editor; si se está editando un acceso, se guarda ya.
+    fn poner_icono(&mut self, icono: Option<String>) {
+        self.icono_editor = icono;
+        self.selector = None;
+        self.foco = None;
+        if let Some(i) = self.seleccion {
+            self.cfg.accesos[i].icono = self.icono_editor.clone();
             self.guardar();
-            self.llenar_accesos(ultima);
-        } else {
-            unsafe {
-                let _ = MessageBeep(MB_OK);
+        }
+    }
+
+    fn cargar_archivo(&mut self) {
+        let ruta = self.campos[CampoId::Archivo as usize].texto.trim().to_string();
+        self.archivo_cantidad = if ruta.is_empty() { 0 } else { icons::cantidad_en_archivo(&ruta).min(5000) };
+        self.scroll_sel = 0.0;
+    }
+
+    fn abrir_selector(&mut self) {
+        let modo = match self.icono_editor.clone() {
+            Some(i) if i.starts_with("archivo:") => {
+                if let Some((ruta, _)) = icons::partir_archivo(&i["archivo:".len()..]) {
+                    self.campo(CampoId::Archivo).poner(&ruta);
+                }
+                ModoSel::Archivo
+            }
+            _ => ModoSel::Lucide,
+        };
+        self.cambiar_modo(modo);
+    }
+
+    fn cambiar_modo(&mut self, modo: ModoSel) {
+        self.selector = Some(modo);
+        self.scroll_sel = 0.0;
+        match modo {
+            ModoSel::Lucide => self.foco = Some(CampoId::BuscarIcono),
+            ModoSel::Archivo => {
+                self.foco = Some(CampoId::Archivo);
+                self.cargar_archivo();
             }
         }
     }
 
-    fn formulario(&self) -> Option<Acceso> {
-        let nombre = leer(self.c.nombre).trim().to_string();
-        let destino = leer(self.c.destino).trim().to_string();
-        let args = leer(self.c.args).trim().to_string();
+    fn agregar_app(&mut self, i: usize) {
+        let Some(app) = self.apps.get(i) else { return };
+        if let Some(ya) = self.cfg.accesos.iter().position(|a| a.destino == app.destino) {
+            self.elegir(Some(ya));
+            return;
+        }
+        self.cfg.accesos.push(Acceso { nombre: app.nombre.clone(), destino: app.destino.clone(), argumentos: None, icono: None });
+        self.guardar();
+        self.elegir(Some(self.cfg.accesos.len() - 1));
+        // Que el recién agregado quede a la vista.
+        self.scroll_accesos = f32::MAX;
+    }
+
+    fn guardar_formulario(&mut self) {
+        let nombre = self.campos[CampoId::Nombre as usize].texto.trim().to_string();
+        let destino = self.campos[CampoId::Destino as usize].texto.trim().to_string();
+        let args = self.campos[CampoId::Args as usize].texto.trim().to_string();
         if nombre.is_empty() || destino.is_empty() {
             unsafe {
                 let _ = MessageBeep(MB_ICONWARNING);
-                let _ = SetFocus(Some(if nombre.is_empty() { self.c.nombre } else { self.c.destino }));
             }
-            return None;
-        }
-        Some(Acceso { nombre, destino, argumentos: (!args.is_empty()).then_some(args) })
-    }
-
-    fn aplicar(&mut self) {
-        let Some(fila) = self.seleccion_accesos() else {
-            // Sin selección, "Guardar cambios" equivale a agregar uno nuevo.
-            return self.nuevo();
-        };
-        let Some(a) = self.formulario() else { return };
-        self.cfg.accesos[fila] = a;
-        self.guardar();
-        self.llenar_accesos(Some(fila));
-    }
-
-    fn nuevo(&mut self) {
-        let Some(a) = self.formulario() else { return };
-        self.cfg.accesos.push(a);
-        self.guardar();
-        self.llenar_accesos(Some(self.cfg.accesos.len() - 1));
-    }
-
-    fn mover(&mut self, delta: isize) {
-        let Some(fila) = self.seleccion_accesos() else { return };
-        let destino = fila as isize + delta;
-        if destino < 0 || destino as usize >= self.cfg.accesos.len() {
+            self.foco = Some(if nombre.is_empty() { CampoId::Nombre } else { CampoId::Destino });
             return;
         }
-        self.cfg.accesos.swap(fila, destino as usize);
+        let acceso = Acceso { nombre, destino, argumentos: (!args.is_empty()).then_some(args), icono: self.icono_editor.clone() };
+        match self.seleccion {
+            Some(i) => self.cfg.accesos[i] = acceso,
+            None => {
+                self.cfg.accesos.push(acceso);
+                self.seleccion = Some(self.cfg.accesos.len() - 1);
+                self.scroll_accesos = f32::MAX;
+            }
+        }
+        self.foco = None;
         self.guardar();
-        self.llenar_accesos(Some(destino as usize));
     }
 
-    fn quitar(&mut self) {
-        let Some(fila) = self.seleccion_accesos() else { return };
-        self.cfg.accesos.remove(fila);
-        self.guardar();
-        let n = self.cfg.accesos.len();
-        self.llenar_accesos((n > 0).then(|| fila.min(n - 1)));
-    }
-
-    fn cambiar_opciones(&mut self) {
-        let abrir_en = if enviar(self.c.abrir_en, CB_GETCURSEL, 0, 0) == 1 { AbrirEn::Centro } else { AbrirEn::Cursor };
-        let retardo = leer(self.c.retardo).trim().parse::<u32>().ok().filter(|r| (50..=1000).contains(r));
-        let mut cambio = abrir_en != self.cfg.abrir_en;
-        self.cfg.abrir_en = abrir_en;
-        if let Some(r) = retardo {
-            cambio |= r != self.cfg.retardo_ms;
-            self.cfg.retardo_ms = r;
-        }
-        if cambio {
-            self.guardar();
+    fn poner_deslizador(&mut self, d: Desliz, x: f32) {
+        let Some((_, pista)) = self.pistas.iter().find(|(id, _)| *id == d) else { return };
+        let v = ((x - pista.left) / (pista.right - pista.left)).clamp(0.0, 1.0);
+        match d {
+            Desliz::Retardo => {
+                let ms = config::RETARDO_MIN as f32 + v * (config::RETARDO_MAX - config::RETARDO_MIN) as f32;
+                self.cfg.retardo_ms = ((ms / 10.0).round() * 10.0) as u32;
+            }
+            Desliz::Tamano => {
+                let t = config::TAMANO_MIN + v * (config::TAMANO_MAX - config::TAMANO_MIN);
+                self.cfg.tamano = (t * 20.0).round() / 20.0;
+            }
+            Desliz::Zona => {
+                self.cfg.zona_central = (config::ZONA_MIN + v * (config::ZONA_MAX - config::ZONA_MIN)).round();
+            }
         }
     }
 
-    fn poner_archivo(&mut self, ruta: String) {
-        if leer(self.c.nombre).trim().is_empty() {
-            let nombre = std::path::Path::new(&ruta)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            escribir(self.c.nombre, &nombre);
+    /// Ejecuta un clic. Lo que necesita un bucle de mensajes propio se devuelve para después.
+    fn ejecutar(&mut self, accion: Accion) -> Option<Diferida> {
+        match accion {
+            Accion::Seccion(s) => {
+                self.seccion = s;
+                self.foco = None;
+                self.selector = None;
+            }
+            Accion::AbrirEn(v) => {
+                self.cfg.abrir_en = v;
+                self.guardar();
+            }
+            Accion::Boton(b) => {
+                self.cfg.boton = b;
+                self.guardar();
+            }
+            Accion::InicioWindows => {
+                autostart::poner(!self.inicio_windows);
+                self.inicio_windows = autostart::activo();
+            }
+            Accion::Oscurecer => {
+                self.cfg.oscurecer = !self.cfg.oscurecer;
+                self.guardar();
+            }
+            Accion::AgregarApp(i) => self.agregar_app(i),
+            Accion::Elegir(i) => self.elegir(Some(i)),
+            Accion::Subir(i) if i > 0 => {
+                self.cfg.accesos.swap(i, i - 1);
+                self.guardar();
+                self.elegir(Some(i - 1));
+            }
+            Accion::Bajar(i) if i + 1 < self.cfg.accesos.len() => {
+                self.cfg.accesos.swap(i, i + 1);
+                self.guardar();
+                self.elegir(Some(i + 1));
+            }
+            Accion::Quitar(i) if i < self.cfg.accesos.len() => {
+                self.cfg.accesos.remove(i);
+                self.guardar();
+                let n = self.cfg.accesos.len();
+                self.elegir((n > 0).then(|| i.min(n - 1)));
+            }
+            Accion::Guardar => self.guardar_formulario(),
+            Accion::Nuevo => {
+                self.elegir(None);
+                self.foco = Some(CampoId::Nombre);
+            }
+            Accion::Recargar => {
+                self.cargando = true;
+                self.apps.clear();
+                self.filtrar();
+                apps::cargar_en_segundo_plano(self.hwnd, WM_APPS_LISTA, WM_APPS_ICONOS);
+            }
+            Accion::Examinar => return Some(Diferida::Examinar),
+            Accion::ExaminarIconos => return Some(Diferida::ExaminarIconos),
+            Accion::AbrirSelector => self.abrir_selector(),
+            Accion::CerrarSelector => {
+                self.selector = None;
+                self.foco = None;
+            }
+            Accion::ModoSelector(m) => self.cambiar_modo(m),
+            Accion::IconoAuto => self.poner_icono(None),
+            Accion::ElegirLucide(i) => self.poner_icono(Some(format!("lucide:{}", lucide::nombre_en(i)))),
+            Accion::ElegirArchivo(i) => {
+                let ruta = self.campos[CampoId::Archivo as usize].texto.trim().to_string();
+                self.poner_icono(Some(format!("archivo:{ruta},{i}")));
+            }
+            Accion::AbrirConfig => {
+                return Some(Diferida::Abrir(Acceso {
+                    nombre: String::new(),
+                    destino: "notepad.exe".into(),
+                    argumentos: Some(format!("\"{}\"", config::ruta().display())),
+                    icono: None,
+                }))
+            }
+            Accion::AbrirCarpeta => {
+                let dir = config::ruta().parent().map(|d| d.display().to_string()).unwrap_or_default();
+                return Some(Diferida::Abrir(Acceso { nombre: String::new(), destino: dir, argumentos: None, icono: None }));
+            }
+            _ => {}
         }
-        escribir(self.c.destino, &ruta);
+        None
+    }
+
+    fn zona_en(&self, x: f32, y: f32) -> Option<Accion> {
+        self.zonas.iter().rev().find(|z| dentro(&z.r, x, y)).map(|z| z.accion)
+    }
+
+    fn zona(&mut self, r: Rect, accion: Accion) {
+        self.zonas.push(Zona { r, accion });
+    }
+
+    /// Coloca el cursor del campo donde se hizo clic.
+    fn cursor_en(&mut self, id: CampoId, x: f32) {
+        let Some(&(_, r, desplaz)) = self.campos_r.iter().find(|(c, _, _)| *c == id) else { return };
+        let Some(p) = self.pintor.as_mut() else { return };
+        let campo = &self.campos[id as usize];
+        let rel = x - (r.left + 12.0) + desplaz;
+        let (mut mejor, mut dist) = (0, f32::MAX);
+        let mut u16s = 0;
+        for (i, c) in campo.texto.chars().chain(std::iter::once(' ')).enumerate() {
+            let px = p.medir_hasta(&campo.texto, 13.0, Peso::Normal, u16s);
+            if (px - rel).abs() < dist {
+                dist = (px - rel).abs();
+                mejor = i;
+            }
+            u16s += c.len_utf16();
+        }
+        self.campos[id as usize].ir(mejor);
     }
 }
 
-/// Diálogo estándar para elegir un archivo o un acceso directo. Se ejecuta sin el estado
-/// prestado: el diálogo tiene su propio bucle de mensajes y la ventana tiene que seguir viva.
-fn examinar(dueño: HWND) -> Option<String> {
+// ─── Dibujo ─────────────────────────────────────────────────────────────────────────────────
+
+impl Ajustes {
+    fn asegurar_rt(&mut self) -> Option<ID2D1HwndRenderTarget> {
+        if let Some(rt) = &self.rt {
+            return Some(rt.clone());
+        }
+        let mut cr = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut cr);
+        }
+        let dpi = self.escala * 96.0;
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: dpi,
+            dpiY: dpi,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        let hprops = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+            hwnd: self.hwnd,
+            pixelSize: D2D_SIZE_U { width: cr.right.max(1) as u32, height: cr.bottom.max(1) as u32 },
+            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        };
+        let rt = unsafe { self.factory.CreateHwndRenderTarget(&props, &hprops).ok()? };
+        self.pintor = Some(Pintor::nuevo(rt.cast().ok()?, self.dwrite.clone()).ok()?);
+        self.rt = Some(rt.clone());
+        Some(rt)
+    }
+
+    fn pintar(&mut self) {
+        let Some(rt) = self.asegurar_rt() else { return };
+        let Some(mut p) = self.pintor.take() else { return };
+        let mut cr = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut cr);
+        }
+        let (w, h) = (cr.right as f32 / self.escala, cr.bottom as f32 / self.escala);
+        self.zonas.clear();
+        self.pistas.clear();
+        self.campos_r.clear();
+        unsafe {
+            rt.BeginDraw();
+            rt.SetTransform(&windows_numerics::Matrix3x2::identity());
+            rt.Clear(Some(&tema::TRANSPARENTE));
+        }
+        // Sobre el acrílico, un velo oscuro que le da el tono; sin acrílico, un fondo opaco.
+        let (fondo, lateral) = if self.vidrio {
+            (rgba(14, 14, 16, 0.58), rgba(255, 255, 255, 0.025))
+        } else {
+            (rgba(24, 24, 27, 1.0), rgba(30, 30, 34, 1.0))
+        };
+        p.rellenar(rect(0.0, 0.0, w, h), 0.0, fondo);
+        p.rellenar(rect(0.0, 0.0, ANCHO_LATERAL, h), 0.0, lateral);
+        p.linea(ANCHO_LATERAL, 0.0, ANCHO_LATERAL, h, tema::SEPARADOR, 1.0);
+
+        self.lateral(&mut p, h);
+        let x = ANCHO_LATERAL + 32.0;
+        let cw = (w - x - 32.0).max(200.0);
+        match self.seccion {
+            Seccion::General => self.general(&mut p, x, cw),
+            Seccion::Activacion => self.activacion(&mut p, x, cw),
+            Seccion::Apariencia => self.apariencia(&mut p, x, cw, h),
+            Seccion::Accesos => self.accesos(&mut p, x, cw, h),
+            Seccion::Acerca => self.acerca(&mut p, x, cw),
+        }
+        if self.seccion == Seccion::Accesos && self.selector.is_some() {
+            self.selector_ui(&mut p, w, h);
+        }
+
+        let r = unsafe { rt.EndDraw(None, None) };
+        self.pintor = Some(p);
+        if r.is_err() {
+            self.rt = None;
+            self.pintor = None;
+        }
+    }
+
+    fn lateral(&mut self, p: &mut Pintor, h: f32) {
+        p.texto("Ajustes", rect(22.0, 20.0, 170.0, 30.0), 20.0, Peso::Semi, Alin::Izq, tema::TEXTO);
+        let mut y = 70.0;
+        for (s, g, nombre) in SECCIONES {
+            let r = rect(10.0, y, ANCHO_LATERAL - 20.0, 36.0);
+            let activa = self.seccion == s;
+            let sobre = self.hover == Some(Accion::Seccion(s));
+            if activa {
+                p.rellenar(r, 7.0, tema::CONTROL_ACTIVO);
+                p.rellenar(rect(r.left, r.top + 10.0, 3.0, 16.0), 1.5, tema::CLARO);
+            } else if sobre {
+                p.rellenar(r, 7.0, tema::CONTROL);
+            }
+            let c = if activa { tema::TEXTO } else { tema::TEXTO_2 };
+            p.glifo(g, r.left + 22.0, r.top + 18.0, 14.0, c);
+            p.texto(nombre, rect(r.left + 42.0, r.top, 140.0, 36.0), 13.0, if activa { Peso::Semi } else { Peso::Normal }, Alin::Izq, c);
+            self.zona(r, Accion::Seccion(s));
+            y += 40.0;
+        }
+        let version = format!("Focus {}", env!("CARGO_PKG_VERSION"));
+        p.texto(&version, rect(22.0, h - 40.0, 170.0, 24.0), 11.5, Peso::Normal, Alin::Izq, tema::TEXTO_3);
+    }
+
+    fn titulo(&self, p: &mut Pintor, x: f32, cw: f32, texto: &str, sub: &str) -> f32 {
+        p.texto(texto, rect(x, 22.0, cw, 34.0), 24.0, Peso::Semi, Alin::Izq, tema::TEXTO);
+        if sub.is_empty() {
+            return 76.0;
+        }
+        p.texto(sub, rect(x, 56.0, cw, 22.0), 12.5, Peso::Normal, Alin::Izq, tema::TEXTO_2);
+        92.0
+    }
+
+    fn cabecera(&self, p: &mut Pintor, x: f32, y: f32, cw: f32, texto: &str) -> f32 {
+        p.texto(texto, rect(x, y, cw, 22.0), 12.0, Peso::Semi, Alin::Izq, tema::TEXTO_2);
+        y + 28.0
+    }
+
+    /// Fila con título y descripción a la izquierda; devuelve el centro vertical del control.
+    fn fila(&self, p: &mut Pintor, x: f32, y: f32, cw: f32, titulo: &str, desc: &str) -> (f32, f32) {
+        let alto = 66.0;
+        p.rellenar(rect(x, y, cw, alto - 6.0), 10.0, tema::CONTROL);
+        let ancho_txt = (cw - 360.0).max(220.0);
+        p.texto(titulo, rect(x + 16.0, y + 9.0, ancho_txt, 22.0), 13.5, Peso::Semi, Alin::Izq, tema::TEXTO);
+        p.texto(desc, rect(x + 16.0, y + 30.0, ancho_txt, 20.0), 12.0, Peso::Normal, Alin::Izq, tema::TEXTO_2);
+        (y + (alto - 6.0) / 2.0, y + alto)
+    }
+
+    fn interruptor(&mut self, p: &mut Pintor, derecha: f32, cy: f32, activo: bool, accion: Accion) {
+        let r = rect(derecha - 44.0, cy - 11.0, 44.0, 22.0);
+        let sobre = self.hover == Some(accion);
+        if activo {
+            p.rellenar(r, 11.0, if sobre { rgba(255, 255, 255, 1.0) } else { tema::CLARO });
+            p.circulo(r.right - 11.0, cy, 7.0, tema::TEXTO_OSCURO);
+        } else {
+            p.rellenar(r, 11.0, if sobre { tema::CONTROL_ACTIVO } else { tema::CONTROL_HOVER });
+            p.bordear(r, 11.0, tema::BORDE_FUERTE, 1.0);
+            p.circulo(r.left + 11.0, cy, 6.0, tema::TEXTO_2);
+        }
+        self.zona(rect(r.left - 4.0, r.top - 4.0, r.right - r.left + 8.0, 30.0), accion);
+    }
+
+    fn segmentado(&mut self, p: &mut Pintor, derecha: f32, cy: f32, opciones: &[(&str, Accion, bool)]) {
+        let anchos: Vec<f32> = opciones.iter().map(|(t, _, _)| p.medir(t, 12.5, Peso::Medio) + 28.0).collect();
+        let total: f32 = anchos.iter().sum::<f32>() + 6.0;
+        let caja = rect(derecha - total, cy - 16.0, total, 32.0);
+        p.rellenar(caja, 9.0, rgba(0, 0, 0, 0.22));
+        p.bordear(caja, 9.0, tema::BORDE, 1.0);
+        let mut x = caja.left + 3.0;
+        for ((texto, accion, sel), ancho) in opciones.iter().zip(anchos) {
+            let r = rect(x, caja.top + 3.0, ancho, 26.0);
+            let sobre = self.hover == Some(*accion);
+            if *sel {
+                p.rellenar(r, 7.0, tema::CLARO);
+            } else if sobre {
+                p.rellenar(r, 7.0, tema::CONTROL_HOVER);
+            }
+            let c = if *sel { tema::TEXTO_OSCURO } else if sobre { tema::TEXTO } else { tema::TEXTO_2 };
+            p.texto(texto, r, 12.5, Peso::Medio, Alin::Centro, c);
+            self.zona(r, *accion);
+            x += ancho;
+        }
+    }
+
+    fn deslizador(&mut self, p: &mut Pintor, derecha: f32, cy: f32, id: Desliz, v: f32, valor: &str) {
+        let ancho = 200.0;
+        let x = derecha - ancho - 70.0;
+        let pista = rect(x, cy - 2.0, ancho, 4.0);
+        let v = v.clamp(0.0, 1.0);
+        p.rellenar(pista, 2.0, tema::CONTROL_ACTIVO);
+        p.rellenar(rect(x, cy - 2.0, ancho * v, 4.0), 2.0, rgba(240, 240, 244, 0.75));
+        let activo = self.arrastre == Some(id) || self.hover == Some(Accion::Deslizador(id));
+        let kx = x + ancho * v;
+        p.circulo(kx, cy + 1.0, 9.0, rgba(0, 0, 0, 0.25));
+        p.circulo(kx, cy, if activo { 9.0 } else { 8.0 }, tema::CLARO);
+        p.texto(valor, rect(derecha - 62.0, cy - 12.0, 62.0, 24.0), 13.0, Peso::Semi, Alin::Der, tema::TEXTO);
+        self.pistas.push((id, pista));
+        self.zona(rect(x - 10.0, cy - 14.0, ancho + 20.0, 28.0), Accion::Deslizador(id));
+    }
+
+    fn boton(&mut self, p: &mut Pintor, r: Rect, texto: &str, g: Option<char>, primario: bool, accion: Accion) {
+        let sobre = self.hover == Some(accion);
+        let (fondo, color): (Color, Color) = match (primario, sobre) {
+            (true, false) => (tema::CLARO, tema::TEXTO_OSCURO),
+            (true, true) => (rgba(255, 255, 255, 1.0), tema::TEXTO_OSCURO),
+            (false, false) => (tema::CONTROL_HOVER, tema::TEXTO),
+            (false, true) => (tema::CONTROL_ACTIVO, tema::TEXTO),
+        };
+        p.rellenar(r, 8.0, fondo);
+        if !primario {
+            p.bordear(r, 8.0, tema::BORDE, 1.0);
+        }
+        match g {
+            Some(g) if texto.is_empty() => p.glifo(g, (r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0, 13.0, color),
+            Some(g) => {
+                let ancho = p.medir(texto, 12.5, Peso::Semi) + 22.0;
+                let x0 = (r.left + r.right - ancho) / 2.0;
+                p.glifo(g, x0 + 7.0, (r.top + r.bottom) / 2.0, 12.0, color);
+                p.texto(texto, rect(x0 + 22.0, r.top, ancho, r.bottom - r.top), 12.5, Peso::Semi, Alin::Izq, color);
+            }
+            None => p.texto(texto, r, 12.5, Peso::Semi, Alin::Centro, color),
+        }
+        self.zona(r, accion);
+    }
+
+    fn icono_boton(&mut self, p: &mut Pintor, cx: f32, cy: f32, g: char, accion: Accion, peligro: bool) {
+        let r = rect(cx - 14.0, cy - 14.0, 28.0, 28.0);
+        let sobre = self.hover == Some(accion);
+        if sobre {
+            p.rellenar(r, 7.0, tema::CONTROL_ACTIVO);
+        }
+        let c = if sobre && peligro { tema::PELIGRO } else if sobre { tema::TEXTO } else { tema::TEXTO_2 };
+        p.glifo(g, cx, cy, 12.0, c);
+        self.zona(r, accion);
+    }
+
+    fn campo_texto(&mut self, p: &mut Pintor, r: Rect, id: CampoId, marcador: &str, g: Option<char>) {
+        let foco = self.foco == Some(id);
+        let sobre = self.hover == Some(Accion::Campo(id));
+        p.rellenar(r, 8.0, if foco { rgba(0, 0, 0, 0.30) } else { rgba(0, 0, 0, 0.20) });
+        p.bordear(r, 8.0, if foco { rgba(255, 255, 255, 0.45) } else if sobre { tema::BORDE_FUERTE } else { tema::BORDE }, 1.0);
+        let mut x0 = r.left + 12.0;
+        if let Some(g) = g {
+            p.glifo(g, r.left + 18.0, (r.top + r.bottom) / 2.0, 12.0, tema::TEXTO_3);
+            x0 = r.left + 34.0;
+        }
+        let interior = rect(x0, r.top, r.right - 10.0 - x0, r.bottom - r.top);
+        let campo = self.campos[id as usize].clone();
+        let ancho_vis = interior.right - interior.left;
+        let cursor_x = p.medir_hasta(&campo.texto, 13.0, Peso::Normal, campo.cursor_utf16());
+        // Desplazamiento horizontal para que el cursor siempre se vea.
+        let desplaz = (cursor_x - ancho_vis + 2.0).max(0.0);
+        p.recortar(interior);
+        if campo.texto.is_empty() {
+            p.texto(marcador, interior, 13.0, Peso::Normal, Alin::Izq, tema::TEXTO_3);
+        } else {
+            if foco && campo.todo {
+                let ancho = p.medir(&campo.texto, 13.0, Peso::Normal);
+                p.rellenar(rect(interior.left - desplaz, r.top + 7.0, ancho, r.bottom - r.top - 14.0), 3.0, rgba(120, 150, 255, 0.45));
+            }
+            let t = rect(interior.left - desplaz, r.top, 10_000.0, r.bottom - r.top);
+            p.texto(&campo.texto, t, 13.0, Peso::Normal, Alin::Izq, tema::TEXTO);
+        }
+        if foco && self.cursor_visible && !campo.todo {
+            let cx = interior.left + cursor_x - desplaz;
+            p.linea(cx, r.top + 8.0, cx, r.bottom - 8.0, tema::TEXTO, 1.2);
+        }
+        p.fin_recorte();
+        self.campos_r.push((id, interior, desplaz));
+        self.zona(r, Accion::Campo(id));
+    }
+
+    // ─── Secciones ──────────────────────────────────────────────────────────────────────────
+
+    fn general(&mut self, p: &mut Pintor, x: f32, cw: f32) {
+        let mut y = self.titulo(p, x, cw, "General", "");
+        y = self.cabecera(p, x, y, cw, "Rueda");
+        let (cy, sig) = self.fila(p, x, y, cw, "Posición", "Dónde aparece la rueda al mantener el botón.");
+        let a = self.cfg.abrir_en;
+        self.segmentado(p, x + cw - 16.0, cy, &[
+            ("Bajo el puntero", Accion::AbrirEn(AbrirEn::Cursor), a == AbrirEn::Cursor),
+            ("Centro de la pantalla", Accion::AbrirEn(AbrirEn::Centro), a == AbrirEn::Centro),
+        ]);
+        y = sig;
+        let (cy, sig) = self.fila(p, x, y, cw, "Retardo", "Cuánto mantenerlo antes de que salga. Un clic corto funciona igual.");
+        let v = (self.cfg.retardo_ms - config::RETARDO_MIN) as f32 / (config::RETARDO_MAX - config::RETARDO_MIN) as f32;
+        let texto = format!("{} ms", self.cfg.retardo_ms);
+        self.deslizador(p, x + cw - 16.0, cy, Desliz::Retardo, v, &texto);
+        y = sig + 14.0;
+        y = self.cabecera(p, x, y, cw, "Sistema");
+        let (cy, _) = self.fila(p, x, y, cw, "Iniciar con Windows", "Focus se abre solo al iniciar sesión y queda en la bandeja.");
+        let activo = self.inicio_windows;
+        self.interruptor(p, x + cw - 16.0, cy, activo, Accion::InicioWindows);
+    }
+
+    fn activacion(&mut self, p: &mut Pintor, x: f32, cw: f32) {
+        let mut y = self.titulo(p, x, cw, "Activación", "");
+        y = self.cabecera(p, x, y, cw, "Ratón");
+        let (cy, sig) = self.fila(p, x, y, cw, "Botón", "Qué botón abre la rueda. Los laterales suelen estar libres.");
+        let b = self.cfg.boton;
+        self.segmentado(p, x + cw - 16.0, cy, &[
+            ("Central", Accion::Boton(Boton::Central), b == Boton::Central),
+            ("Atrás", Accion::Boton(Boton::Atras), b == Boton::Atras),
+            ("Adelante", Accion::Boton(Boton::Adelante), b == Boton::Adelante),
+        ]);
+        y = sig;
+        let (cy, sig) = self.fila(p, x, y, cw, "Zona para cancelar", "Radio del círculo central: si sueltas dentro, no se abre nada.");
+        let v = (self.cfg.zona_central - config::ZONA_MIN) / (config::ZONA_MAX - config::ZONA_MIN);
+        let texto = format!("{} px", self.cfg.zona_central as i32);
+        self.deslizador(p, x + cw - 16.0, cy, Desliz::Zona, v, &texto);
+        y = sig + 14.0;
+        y = self.cabecera(p, x, y, cw, "Teclado");
+        let (cy, _) = self.fila(p, x, y, cw, "Escape", "Con la rueda abierta, Escape la cierra sin abrir nada.");
+        p.texto("Siempre activo", rect(x + cw - 216.0, cy - 12.0, 200.0, 24.0), 12.5, Peso::Normal, Alin::Der, tema::TEXTO_3);
+    }
+
+    fn apariencia(&mut self, p: &mut Pintor, x: f32, cw: f32, h: f32) {
+        let mut y = self.titulo(p, x, cw, "Apariencia", "");
+        y = self.cabecera(p, x, y, cw, "Rueda");
+        let (cy, sig) = self.fila(p, x, y, cw, "Tamaño", "Escala de las baldosas y del círculo.");
+        let v = (self.cfg.tamano - config::TAMANO_MIN) / (config::TAMANO_MAX - config::TAMANO_MIN);
+        let texto = format!("{} %", (self.cfg.tamano * 100.0).round() as i32);
+        self.deslizador(p, x + cw - 16.0, cy, Desliz::Tamano, v, &texto);
+        y = sig;
+        let (cy, sig) = self.fila(p, x, y, cw, "Oscurecer el fondo", "Atenúa un poco la pantalla mientras la rueda está abierta.");
+        let o = self.cfg.oscurecer;
+        self.interruptor(p, x + cw - 16.0, cy, o, Accion::Oscurecer);
+        y = sig + 14.0;
+
+        // Vista previa en vivo, con los accesos y el tamaño actuales.
+        y = self.cabecera(p, x, y, cw, "Vista previa");
+        let caja = rect(x, y, cw, (h - y - 24.0).max(120.0));
+        p.rellenar(caja, 12.0, rgba(0, 0, 0, 0.25));
+        p.bordear(caja, 12.0, tema::BORDE, 1.0);
+        let nombres: Vec<String> = self.cfg.accesos.iter().map(|a| a.nombre.clone()).collect();
+        let iconos: Vec<_> = self.cfg.accesos.iter().map(icons::visual).collect();
+        // Cabe en la caja: si la rueda es más grande que el espacio, se reduce solo en la vista.
+        let alcance = crate::wheel::alcance(nombres.len()) * self.cfg.tamano;
+        let lado = (caja.right - caja.left).min(caja.bottom - caja.top);
+        let ajuste = (lado / 2.0 / alcance).min(1.0);
+        let escena = Escena {
+            centro: ((caja.left + caja.right) / 2.0, (caja.top + caja.bottom) / 2.0),
+            escala: self.cfg.tamano * ajuste,
+            nombres: &nombres,
+            iconos: &iconos,
+            seleccion: (!nombres.is_empty()).then_some(0),
+            progreso: 1.0,
+            oscurecer: false,
+            radio_central: self.cfg.zona_central * self.cfg.tamano * ajuste,
+        };
+        p.recortar(caja);
+        render::pintar_rueda(p, &escena);
+        p.fin_recorte();
+    }
+
+    fn accesos(&mut self, p: &mut Pintor, x: f32, cw: f32, h: f32) {
+        let y = self.titulo(p, x, cw, "Accesos", "Elige qué aparece en la rueda. El orden sigue las agujas del reloj, empezando arriba.");
+        let sep = 24.0;
+        let col = (cw - sep) / 2.0;
+        let (xi, xd) = (x, x + col + sep);
+
+        // ── Izquierda: apps instaladas ──
+        p.texto("Aplicaciones instaladas", rect(xi, y, col - 40.0, 24.0), 13.5, Peso::Semi, Alin::Izq, tema::TEXTO);
+        self.icono_boton(p, xi + col - 14.0, y + 12.0, glifo::RECARGAR, Accion::Recargar, false);
+        self.campo_texto(p, rect(xi, y + 34.0, col, 36.0), CampoId::Buscar, "Buscar aplicación…", Some(glifo::BUSCAR));
+        let area = rect(xi, y + 80.0, col, h - y - 80.0 - 24.0);
+        self.area_apps = area;
+        p.rellenar(area, 10.0, rgba(0, 0, 0, 0.18));
+        p.bordear(area, 10.0, tema::BORDE, 1.0);
+        let interior = rect(area.left + 4.0, area.top + 4.0, area.right - area.left - 8.0, area.bottom - area.top - 8.0);
+        let alto_vis = interior.bottom - interior.top;
+        self.max_apps = (self.filtradas.len() as f32 * FILA_APP - alto_vis).max(0.0);
+        self.scroll_apps = self.scroll_apps.clamp(0.0, self.max_apps);
+        p.recortar(interior);
+        if self.cargando {
+            p.texto("Cargando aplicaciones…", interior, 13.0, Peso::Normal, Alin::Centro, tema::TEXTO_2);
+        } else if self.filtradas.is_empty() {
+            p.texto("Ninguna aplicación coincide", interior, 13.0, Peso::Normal, Alin::Centro, tema::TEXTO_2);
+        }
+        let primera = (self.scroll_apps / FILA_APP) as usize;
+        let ultima = ((self.scroll_apps + alto_vis) / FILA_APP).ceil() as usize + 1;
+        for fila in primera..ultima.min(self.filtradas.len()) {
+            let i = self.filtradas[fila];
+            let ry = interior.top + fila as f32 * FILA_APP - self.scroll_apps;
+            let r = rect(interior.left, ry, interior.right - interior.left, FILA_APP);
+            let accion = Accion::AgregarApp(i);
+            let sobre = self.hover == Some(accion);
+            let ya = self.en_rueda(&self.apps[i].destino);
+            if sobre {
+                p.rellenar(r, 7.0, tema::CONTROL_HOVER);
+            }
+            if let Some(ic) = self.apps[i].icono.clone() {
+                p.imagen(&ic, rect(r.left + 10.0, ry + 8.0, 24.0, 24.0), 1.0);
+            }
+            let nombre = self.apps[i].nombre.clone();
+            p.texto(&nombre, rect(r.left + 44.0, ry, r.right - r.left - 84.0, FILA_APP), 13.0, Peso::Normal, Alin::Izq, tema::TEXTO);
+            if ya {
+                p.glifo(glifo::CHECK, r.right - 20.0, ry + FILA_APP / 2.0, 12.0, tema::TEXTO_3);
+            } else if sobre {
+                p.glifo(glifo::MAS, r.right - 20.0, ry + FILA_APP / 2.0, 12.0, tema::TEXTO);
+            }
+            // La zona se recorta al área visible de la lista.
+            let rz = rect(r.left, ry.max(interior.top), r.right - r.left, (ry + FILA_APP).min(interior.bottom) - ry.max(interior.top));
+            self.zona(rz, accion);
+        }
+        p.fin_recorte();
+        self.barra(p, interior, self.scroll_apps, self.max_apps);
+
+        // ── Derecha: la rueda y el editor ──
+        let n = self.cfg.accesos.len();
+        let cuenta = match n {
+            0 => "En la rueda".to_string(),
+            n if n > RECOMENDADO => format!("En la rueda · {n} (se recomiendan hasta {RECOMENDADO})"),
+            n => format!("En la rueda · {n}"),
+        };
+        p.texto(&cuenta, rect(xd, y, col, 24.0), 13.5, Peso::Semi, Alin::Izq, tema::TEXTO);
+        let alto_editor = 278.0;
+        let area = rect(xd, y + 34.0, col, h - y - 34.0 - 24.0 - alto_editor - 14.0);
+        self.area_accesos = area;
+        p.rellenar(area, 10.0, rgba(0, 0, 0, 0.18));
+        p.bordear(area, 10.0, tema::BORDE, 1.0);
+        let interior = rect(area.left + 4.0, area.top + 4.0, area.right - area.left - 8.0, area.bottom - area.top - 8.0);
+        let alto_vis = interior.bottom - interior.top;
+        self.max_accesos = (n as f32 * FILA_ACCESO - alto_vis).max(0.0);
+        self.scroll_accesos = self.scroll_accesos.clamp(0.0, self.max_accesos);
+        p.recortar(interior);
+        if n == 0 {
+            p.texto("Agrega apps desde la lista de la izquierda", interior, 13.0, Peso::Normal, Alin::Centro, tema::TEXTO_2);
+        }
+        for i in 0..n {
+            let ry = interior.top + i as f32 * FILA_ACCESO - self.scroll_accesos;
+            if ry + FILA_ACCESO < interior.top || ry > interior.bottom {
+                continue;
+            }
+            let r = rect(interior.left, ry, interior.right - interior.left, FILA_ACCESO);
+            let elegida = self.seleccion == Some(i);
+            let sobre = matches!(self.hover, Some(Accion::Elegir(j) | Accion::Subir(j) | Accion::Bajar(j) | Accion::Quitar(j)) if j == i);
+            if elegida {
+                p.rellenar(r, 7.0, tema::CONTROL_ACTIVO);
+            } else if sobre {
+                p.rellenar(r, 7.0, tema::CONTROL_HOVER);
+            }
+            let rz = rect(r.left, ry.max(interior.top), r.right - r.left, (ry + FILA_ACCESO).min(interior.bottom) - ry.max(interior.top));
+            self.zona(rz, Accion::Elegir(i));
+            let acceso = self.cfg.accesos[i].clone();
+            p.texto(&format!("{}", i + 1), rect(r.left + 6.0, ry, 18.0, FILA_ACCESO), 11.5, Peso::Normal, Alin::Centro, tema::TEXTO_3);
+            match icons::visual(&acceso) {
+                Some(v) => p.visual(&v, rect(r.left + 30.0, ry + 9.0, 26.0, 26.0), tema::TEXTO),
+                None => {
+                    let ri = rect(r.left + 30.0, ry + 9.0, 26.0, 26.0);
+                    p.rellenar(ri, 7.0, tema::CONTROL_ACTIVO);
+                    let ini: String = acceso.nombre.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+                    p.texto(&ini, ri, 12.0, Peso::Semi, Alin::Centro, tema::TEXTO);
+                }
+            }
+            let ancho_txt = r.right - r.left - 66.0 - if sobre || elegida { 100.0 } else { 0.0 };
+            p.texto(&acceso.nombre, rect(r.left + 66.0, ry, ancho_txt, FILA_ACCESO), 13.0, Peso::Medio, Alin::Izq, tema::TEXTO);
+            if sobre || elegida {
+                let cy = ry + FILA_ACCESO / 2.0;
+                self.icono_boton(p, r.right - 86.0, cy, glifo::ARRIBA, Accion::Subir(i), false);
+                self.icono_boton(p, r.right - 54.0, cy, glifo::ABAJO, Accion::Bajar(i), false);
+                self.icono_boton(p, r.right - 20.0, cy, glifo::BORRAR, Accion::Quitar(i), true);
+            }
+        }
+        p.fin_recorte();
+        self.barra(p, interior, self.scroll_accesos, self.max_accesos);
+
+        // Editor del acceso elegido (o de uno nuevo).
+        let ed = rect(xd, area.bottom + 14.0, col, alto_editor);
+        p.rellenar(ed, 10.0, tema::CONTROL);
+        p.bordear(ed, 10.0, tema::BORDE, 1.0);
+        let titulo = if self.seleccion.is_some() { "Editar acceso" } else { "Nuevo acceso personalizado" };
+        p.texto(titulo, rect(ed.left + 16.0, ed.top + 10.0, col - 32.0, 24.0), 13.0, Peso::Semi, Alin::Izq, tema::TEXTO);
+        let et = 86.0;
+        let xc = ed.left + 16.0 + et;
+        let wc = col - 32.0 - et;
+        let mut fy = ed.top + 42.0;
+        for (id, etiqueta, marcador) in [
+            (CampoId::Nombre, "Nombre", "Cómo se ve en la rueda"),
+            (CampoId::Destino, "Destino", "Programa, carpeta, archivo, URL o ms-settings:"),
+            (CampoId::Args, "Argumentos", "Opcional"),
+        ] {
+            p.texto(etiqueta, rect(ed.left + 16.0, fy, et, 34.0), 12.5, Peso::Normal, Alin::Izq, tema::TEXTO_2);
+            let ancho = if id == CampoId::Destino { wc - 42.0 } else { wc };
+            self.campo_texto(p, rect(xc, fy, ancho, 34.0), id, marcador, None);
+            if id == CampoId::Destino {
+                self.boton(p, rect(xc + wc - 34.0, fy, 34.0, 34.0), "", Some(glifo::CARPETA), false, Accion::Examinar);
+            }
+            fy += 42.0;
+        }
+        // Ícono: vista previa, elegir uno propio o volver al automático.
+        p.texto("Ícono", rect(ed.left + 16.0, fy, et, 34.0), 12.5, Peso::Normal, Alin::Izq, tema::TEXTO_2);
+        let caja = rect(xc, fy, 34.0, 34.0);
+        p.rellenar(caja, 8.0, rgba(0, 0, 0, 0.25));
+        p.bordear(caja, 8.0, tema::BORDE, 1.0);
+        let destino = self.campos[CampoId::Destino as usize].texto.clone();
+        let vista = match &self.icono_editor {
+            Some(i) => icons::visual_propio(i),
+            None => icons::automatico(&destino),
+        };
+        if let Some(v) = vista {
+            p.visual(&v, rect(xc + 6.0, fy + 6.0, 22.0, 22.0), tema::TEXTO);
+        }
+        self.boton(p, rect(xc + 44.0, fy, 110.0, 34.0), "Elegir…", None, false, Accion::AbrirSelector);
+        // Con un ícono propio, un botón para volver al automático.
+        if self.icono_editor.is_some() {
+            self.boton(p, rect(xc + 162.0, fy, (wc - 162.0).min(116.0), 34.0), "Automático", None, false, Accion::IconoAuto);
+        }
+        fy += 42.0;
+        let wb = (wc - 10.0) / 2.0;
+        self.boton(p, rect(xc, fy + 4.0, wb, 34.0), "Guardar", Some(glifo::CHECK), true, Accion::Guardar);
+        self.boton(p, rect(xc + wb + 10.0, fy + 4.0, wb, 34.0), "Nuevo", Some(glifo::MAS), false, Accion::Nuevo);
+    }
+
+    /// Panel para elegir un ícono: los de Lucide o los que trae un archivo.
+    fn selector_ui(&mut self, p: &mut Pintor, w: f32, h: f32) {
+        let Some(modo) = self.selector else { return };
+        // Velo sobre todo: un clic fuera del panel lo cierra.
+        p.rellenar(rect(0.0, 0.0, w, h), 0.0, rgba(0, 0, 0, 0.55));
+        self.zona(rect(0.0, 0.0, w, h), Accion::CerrarSelector);
+        let ancho = (w - ANCHO_LATERAL - 80.0).min(760.0);
+        let panel = rect(ANCHO_LATERAL + (w - ANCHO_LATERAL - ancho) / 2.0, 40.0, ancho, h - 80.0);
+        p.sombra(panel, 14.0, 2.0);
+        p.rellenar(panel, 14.0, rgba(30, 30, 34, 0.98));
+        p.bordear(panel, 14.0, tema::BORDE_FUERTE, 1.0);
+        self.zona(panel, Accion::Bloqueo);
+
+        let (x0, x1) = (panel.left + 20.0, panel.right - 20.0);
+        p.texto("Elegir ícono", rect(x0, panel.top + 16.0, 200.0, 30.0), 17.0, Peso::Semi, Alin::Izq, tema::TEXTO);
+        self.icono_boton(p, x1 - 14.0, panel.top + 31.0, glifo::CERRAR, Accion::CerrarSelector, false);
+        self.segmentado(p, x1 - 40.0, panel.top + 31.0, &[
+            ("Lucide", Accion::ModoSelector(ModoSel::Lucide), modo == ModoSel::Lucide),
+            ("Archivo", Accion::ModoSelector(ModoSel::Archivo), modo == ModoSel::Archivo),
+        ]);
+
+        let y = panel.top + 62.0;
+        let total = match modo {
+            ModoSel::Lucide => {
+                self.campo_texto(p, rect(x0, y, x1 - x0, 36.0), CampoId::BuscarIcono, "Buscar ícono (en inglés: home, mail, music…)", Some(glifo::BUSCAR));
+                self.lucide_filtrados.len()
+            }
+            ModoSel::Archivo => {
+                self.campo_texto(p, rect(x0, y, x1 - x0 - 44.0, 36.0), CampoId::Archivo, "Ruta de un .dll, .exe o .ico", None);
+                self.boton(p, rect(x1 - 36.0, y, 36.0, 36.0), "", Some(glifo::CARPETA), false, Accion::ExaminarIconos);
+                self.archivo_cantidad as usize
+            }
+        };
+
+        let area = rect(x0, y + 48.0, x1 - x0, panel.bottom - 40.0 - (y + 48.0));
+        self.area_sel = area;
+        p.rellenar(area, 10.0, rgba(0, 0, 0, 0.22));
+        let interior = rect(area.left + 6.0, area.top + 6.0, area.right - area.left - 12.0, area.bottom - area.top - 12.0);
+        let cols = ((interior.right - interior.left) / CELDA).floor().max(1.0) as usize;
+        let filas = total.div_ceil(cols);
+        let alto_vis = interior.bottom - interior.top;
+        self.max_sel = (filas as f32 * CELDA - alto_vis).max(0.0);
+        self.scroll_sel = self.scroll_sel.clamp(0.0, self.max_sel);
+        let margen = ((interior.right - interior.left) - cols as f32 * CELDA) / 2.0;
+
+        let mut nombre_hover = None;
+        p.recortar(interior);
+        if total == 0 {
+            let aviso = match modo {
+                ModoSel::Lucide => "Ningún ícono coincide",
+                ModoSel::Archivo => "Este archivo no tiene íconos (o no existe)",
+            };
+            p.texto(aviso, interior, 13.0, Peso::Normal, Alin::Centro, tema::TEXTO_2);
+        }
+        let ruta = self.campos[CampoId::Archivo as usize].texto.trim().to_string();
+        let primera = (self.scroll_sel / CELDA) as usize;
+        let ultima = ((self.scroll_sel + alto_vis) / CELDA).ceil() as usize + 1;
+        for fila in primera..ultima.min(filas) {
+            for col in 0..cols {
+                let k = fila * cols + col;
+                if k >= total {
+                    break;
+                }
+                let cx = interior.left + margen + col as f32 * CELDA;
+                let cy = interior.top + fila as f32 * CELDA - self.scroll_sel;
+                let celda = rect(cx + 3.0, cy + 3.0, CELDA - 6.0, CELDA - 6.0);
+                let (accion, elegido) = match modo {
+                    ModoSel::Lucide => {
+                        let i = self.lucide_filtrados[k];
+                        let n = lucide::nombre_en(i);
+                        (Accion::ElegirLucide(i), self.icono_editor.as_deref() == Some(format!("lucide:{n}").as_str()))
+                    }
+                    ModoSel::Archivo => {
+                        (Accion::ElegirArchivo(k as i32), self.icono_editor.as_deref() == Some(format!("archivo:{ruta},{k}").as_str()))
+                    }
+                };
+                let sobre = self.hover == Some(accion);
+                if elegido {
+                    p.rellenar(celda, 8.0, tema::CONTROL_ACTIVO);
+                    p.bordear(celda, 8.0, rgba(255, 255, 255, 0.45), 1.0);
+                } else if sobre {
+                    p.rellenar(celda, 8.0, tema::CONTROL_HOVER);
+                }
+                let (mx, my) = (cx + CELDA / 2.0, cy + CELDA / 2.0);
+                match modo {
+                    ModoSel::Lucide => {
+                        let n = lucide::nombre_en(self.lucide_filtrados[k]);
+                        let c = if sobre || elegido { tema::TEXTO } else { tema::TEXTO_2 };
+                        p.lucide(n, rect(mx - 12.0, my - 12.0, 24.0, 24.0), c);
+                        if sobre {
+                            nombre_hover = Some(n.to_string());
+                        }
+                    }
+                    ModoSel::Archivo => {
+                        let ic = self
+                            .iconos_archivo
+                            .entry((ruta.clone(), k as i32))
+                            .or_insert_with(|| {
+                                icons::de_archivo(&ruta, k as i32, 64)
+                                    .map(|(an, al, px)| Arc::new(Icono::nuevo(format!("sel:{ruta},{k}"), an, al, px)))
+                            })
+                            .clone();
+                        if let Some(ic) = ic {
+                            p.imagen(&ic, rect(mx - 16.0, my - 16.0, 32.0, 32.0), 1.0);
+                        }
+                        if sobre {
+                            nombre_hover = Some(format!("Ícono {k}"));
+                        }
+                    }
+                }
+                let arriba = celda.top.max(interior.top);
+                let abajo = celda.bottom.min(interior.bottom);
+                if abajo > arriba {
+                    self.zona(rect(celda.left, arriba, CELDA - 6.0, abajo - arriba), accion);
+                }
+            }
+        }
+        p.fin_recorte();
+        self.barra(p, interior, self.scroll_sel, self.max_sel);
+
+        let pie = match (nombre_hover, modo) {
+            (Some(n), _) => n,
+            (None, ModoSel::Lucide) => format!("{total} íconos de Lucide (lucide.dev, licencia ISC)"),
+            (None, ModoSel::Archivo) => format!("{total} íconos en el archivo"),
+        };
+        p.texto(&pie, rect(x0, panel.bottom - 34.0, x1 - x0, 24.0), 12.0, Peso::Normal, Alin::Izq, tema::TEXTO_2);
+    }
+
+    fn acerca(&mut self, p: &mut Pintor, x: f32, cw: f32) {
+        let mut y = self.titulo(p, x, cw, "Acerca de", "");
+        let (cy, sig) = self.fila(p, x, y, cw, "Versión", "Lanzador radial para Windows, en Rust nativo.");
+        p.texto(env!("CARGO_PKG_VERSION"), rect(x + cw - 216.0, cy - 12.0, 200.0, 24.0), 13.0, Peso::Semi, Alin::Der, tema::TEXTO);
+        y = sig;
+        let ruta = config::ruta().display().to_string();
+        let (cy, sig) = self.fila(p, x, y, cw, "Archivo de configuración", &ruta);
+        self.boton(p, rect(x + cw - 16.0 - 220.0, cy - 16.0, 100.0, 32.0), "Abrir", None, false, Accion::AbrirConfig);
+        self.boton(p, rect(x + cw - 16.0 - 110.0, cy - 16.0, 110.0, 32.0), "Carpeta", Some(glifo::CARPETA), false, Accion::AbrirCarpeta);
+        y = sig + 14.0;
+        y = self.cabecera(p, x, y, cw, "Cómo se usa");
+        let texto = "Mantén pulsado el botón configurado en cualquier sitio, apunta hacia un acceso y suelta. \
+                     Suelta en el centro o pulsa Escape para cancelar. Un clic corto funciona como siempre.";
+        p.parrafo(texto, rect(x, y, cw.min(640.0), 80.0), 13.0, tema::TEXTO_2);
+    }
+
+    /// Barra de desplazamiento fina, solo si hace falta.
+    fn barra(&self, p: &mut Pintor, area: Rect, scroll: f32, max: f32) {
+        if max <= 0.0 {
+            return;
+        }
+        let alto = area.bottom - area.top;
+        let total = alto + max;
+        let largo = (alto * alto / total).max(28.0);
+        let y = area.top + (alto - largo) * (scroll / max);
+        p.rellenar(rect(area.right - 5.0, y, 3.0, largo), 1.5, rgba(255, 255, 255, 0.22));
+    }
+}
+
+// ─── Teclado y portapapeles ─────────────────────────────────────────────────────────────────
+
+fn portapapeles() -> Option<String> {
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let texto = (|| {
+            let h = GetClipboardData(13 /* CF_UNICODETEXT */).ok()?;
+            let global = windows::Win32::Foundation::HGLOBAL(h.0);
+            let p = GlobalLock(global) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut n = 0;
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = GlobalUnlock(global);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        texto
+    }
+}
+
+impl Ajustes {
+    fn caracter(&mut self, c: u16) -> Option<Diferida> {
+        if c == 0x1B && self.selector.is_some() {
+            self.selector = None;
+            self.foco = None;
+            return None;
+        }
+        let Some(id) = self.foco else {
+            if c == 0x1B {
+                unsafe {
+                    let _ = DestroyWindow(self.hwnd);
+                }
+            }
+            return None;
+        };
+        self.cursor_visible = true;
+        match c {
+            0x08 => self.campo(id).borrar_atras(),
+            0x01 => self.campo(id).todo = true,
+            0x16 => {
+                if let Some(t) = portapapeles() {
+                    self.campo(id).insertar(&t);
+                }
+            }
+            0x0D => match id {
+                CampoId::Buscar => {
+                    if let Some(&i) = self.filtradas.first() {
+                        self.agregar_app(i);
+                    }
+                }
+                CampoId::BuscarIcono => {
+                    if let Some(&i) = self.lucide_filtrados.first() {
+                        self.poner_icono(Some(format!("lucide:{}", lucide::nombre_en(i))));
+                    }
+                }
+                CampoId::Archivo => self.cargar_archivo(),
+                _ => self.guardar_formulario(),
+            },
+            0x1B => self.foco = None,
+            0x09 if self.selector.is_some() => {}
+            0x09 => {
+                let orden = [CampoId::Buscar, CampoId::Nombre, CampoId::Destino, CampoId::Args];
+                let i = orden.iter().position(|x| *x == id).unwrap_or(0);
+                self.foco = Some(orden[(i + 1) % orden.len()]);
+            }
+            0xD800..=0xDBFF => self.sustituto = Some(c),
+            0xDC00..=0xDFFF => {
+                if let Some(alto) = self.sustituto.take() {
+                    let s = String::from_utf16_lossy(&[alto, c]);
+                    self.campo(id).insertar(&s);
+                }
+            }
+            c if c >= 0x20 && c != 0x7F => {
+                let s = String::from_utf16_lossy(&[c]);
+                self.campo(id).insertar(&s);
+            }
+            _ => {}
+        }
+        if c != 0x0D && c != 0x09 && c != 0x1B {
+            self.al_cambiar(id);
+        }
+        None
+    }
+
+    /// Lo que depende del texto de un campo (filtros de búsqueda, archivo de íconos).
+    fn al_cambiar(&mut self, id: CampoId) {
+        match id {
+            CampoId::Buscar => self.filtrar(),
+            CampoId::BuscarIcono => {
+                self.lucide_filtrados = lucide::buscar(&self.campos[id as usize].texto);
+                self.scroll_sel = 0.0;
+            }
+            CampoId::Archivo => self.cargar_archivo(),
+            _ => {}
+        }
+    }
+
+    fn tecla(&mut self, vk: u16) -> bool {
+        let Some(id) = self.foco else { return false };
+        self.cursor_visible = true;
+        let campo = self.campo(id);
+        match VIRTUAL_KEY(vk) {
+            VK_LEFT => campo.mover(-1),
+            VK_RIGHT => campo.mover(1),
+            VK_HOME => campo.ir(0),
+            VK_END => campo.ir(usize::MAX),
+            VK_DELETE => {
+                campo.borrar_delante();
+                self.al_cambiar(id);
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+fn examinar(dueño: HWND, filtro: PCWSTR, titulo: PCWSTR) -> Option<String> {
     let mut buf = vec![0u16; 1024];
-    let filtro = w!("Programas y accesos directos\0*.exe;*.lnk;*.bat;*.cmd;*.ps1\0Todos los archivos\0*.*\0\0");
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: dueño,
         lpstrFilter: filtro,
         lpstrFile: PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
-        lpstrTitle: w!("Elegir un archivo para la rueda"),
+        lpstrTitle: titulo,
         // Sin seguir los .lnk: el acceso directo conserva sus argumentos y su ícono.
         Flags: OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_NODEREFERENCELINKS | OFN_EXPLORER,
         ..Default::default()
@@ -712,133 +1470,261 @@ fn examinar(dueño: HWND) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..fin]))
 }
 
+fn hacer(d: Diferida, hwnd: HWND) {
+    match d {
+        Diferida::ExaminarIconos => {
+            let filtro = w!("Archivos con íconos\0*.dll;*.exe;*.ico;*.cpl;*.mun\0Todos los archivos\0*.*\0\0");
+            if let Some(ruta) = examinar(hwnd, filtro, w!("Elegir un archivo con íconos")) {
+                con_ajustes(|a| {
+                    a.campo(CampoId::Archivo).poner(&ruta);
+                    a.cargar_archivo();
+                    a.invalidar();
+                });
+            }
+        }
+        Diferida::Examinar => {
+            let filtro = w!("Programas y accesos directos\0*.exe;*.lnk;*.bat;*.cmd;*.ps1\0Todos los archivos\0*.*\0\0");
+            if let Some(ruta) = examinar(hwnd, filtro, w!("Elegir un archivo para la rueda")) {
+                con_ajustes(|a| {
+                    if a.campos[CampoId::Nombre as usize].texto.trim().is_empty() {
+                        let nombre = std::path::Path::new(&ruta).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        a.campo(CampoId::Nombre).poner(&nombre);
+                    }
+                    a.campo(CampoId::Destino).poner(&ruta);
+                    a.invalidar();
+                });
+            }
+        }
+        Diferida::Abrir(acceso) => launch::abrir(&acceso),
+    }
+}
+
 // ─── Procedimiento de ventana ───────────────────────────────────────────────────────────────
+
+fn punto(lparam: LPARAM) -> (i32, i32) {
+    ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32)
+}
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        // Fondo blanco para las etiquetas, como el de la ventana. No necesita el estado.
-        WM_CTLCOLORSTATIC => unsafe {
-            let dc = HDC(wparam.0 as *mut _);
-            SetBkMode(dc, TRANSPARENT);
-            return LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize);
-        },
+        WM_ERASEBKGND => return LRESULT(1),
         WM_GETMINMAXINFO => unsafe {
-            let s = escala(hwnd);
+            let s = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
-            info.ptMinTrackSize = POINT { x: (780.0 * s) as i32, y: (560.0 * s) as i32 };
+            info.ptMinTrackSize = POINT { x: (860.0 * s) as i32, y: (600.0 * s) as i32 };
             return LRESULT(0);
         },
-        WM_COMMAND if (wparam.0 & 0xFFFF) as i32 == ID_EXAMINAR => {
-            if let Some(ruta) = examinar(hwnd) {
-                con_ajustes(|a| a.poner_archivo(ruta));
-            }
-            return LRESULT(0);
-        }
         WM_APPS_LISTA => {
             let lista = unsafe { Box::from_raw(lparam.0 as *mut Vec<AppInstalada>) };
             con_ajustes(|a| {
                 a.apps = *lista;
                 a.cargando = false;
                 a.filtrar();
+                a.invalidar();
             });
             return LRESULT(0);
         }
         WM_APPS_ICONOS => {
-            let tanda = unsafe { Box::from_raw(lparam.0 as *mut Vec<(usize, i32)>) };
-            con_ajustes(|a| a.recibir_iconos(*tanda));
+            let tanda = unsafe { Box::from_raw(lparam.0 as *mut Vec<(usize, Option<icons::IconoRef>)>) };
+            con_ajustes(|a| {
+                for (i, ic) in *tanda {
+                    if let Some(app) = a.apps.get_mut(i) {
+                        app.icono = ic;
+                    }
+                }
+                a.invalidar();
+            });
             return LRESULT(0);
         }
         WM_DESTROY => {
             VENTANA.store(0, Ordering::Relaxed);
-            let fuentes = AJUSTES.with(|s| s.borrow_mut().take()).map(|a| (a.fuente, a.fuente_titulo));
-            if let Some((f, t)) = fuentes {
-                unsafe {
-                    let _ = DeleteObject(f.into());
-                    let _ = DeleteObject(t.into());
-                }
-            }
+            AJUSTES.with(|s| s.borrow_mut().take());
             return LRESULT(0);
         }
         _ => {}
     }
 
+    let mut diferida = None;
     let manejado = con_ajustes(|a| unsafe {
         match msg {
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                BeginPaint(hwnd, &mut ps);
+                a.pintar();
+                let _ = EndPaint(hwnd, &ps);
+            }
             WM_SIZE => {
-                a.distribuir();
-                true
+                if let Some(rt) = &a.rt {
+                    let (w, h) = ((lparam.0 & 0xFFFF) as u32, ((lparam.0 >> 16) & 0xFFFF) as u32);
+                    let _ = rt.Resize(&D2D_SIZE_U { width: w.max(1), height: h.max(1) });
+                }
+                a.invalidar();
             }
             WM_DPICHANGED => {
+                a.escala = ((wparam.0 & 0xFFFF) as f32 / 96.0).max(1.0);
+                a.rt = None;
+                a.pintor = None;
                 let r = &*(lparam.0 as *const RECT);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                a.fuentes();
-                a.distribuir();
-                true
+                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                a.invalidar();
             }
-            WM_COMMAND => {
-                let id = (wparam.0 & 0xFFFF) as i32;
-                let codigo = ((wparam.0 >> 16) & 0xFFFF) as u32;
-                match (id, codigo) {
-                    (ID_BUSCAR, EN_CHANGE) => a.filtrar(),
-                    (ID_RETARDO, EN_CHANGE) => a.cambiar_opciones(),
-                    (ID_ABRIR_EN, CBN_SELCHANGE) => a.cambiar_opciones(),
-                    (ID_AGREGAR, _) => a.agregar_apps(),
-                    (ID_RECARGAR, _) => {
-                        a.cargando = true;
-                        a.filtrar();
-                        apps::cargar_en_segundo_plano(hwnd, WM_APPS_LISTA, WM_APPS_ICONOS);
+            WM_TIMER if wparam.0 == TIMER_CURSOR => {
+                if a.foco.is_some() {
+                    a.cursor_visible = !a.cursor_visible;
+                    a.invalidar();
+                }
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = punto(lparam);
+                a.raton = (x as f32 / a.escala, y as f32 / a.escala);
+                if let Some(d) = a.arrastre {
+                    a.poner_deslizador(d, a.raton.0);
+                    a.invalidar();
+                }
+                let nuevo = a.zona_en(a.raton.0, a.raton.1);
+                if nuevo != a.hover {
+                    a.hover = nuevo;
+                    a.invalidar();
+                }
+                let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            WM_MOUSELEAVE => {
+                a.hover = None;
+                a.invalidar();
+            }
+            WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+                let cursor = match a.hover {
+                    Some(Accion::Campo(_)) => IDC_IBEAM,
+                    Some(_) => IDC_HAND,
+                    None => IDC_ARROW,
+                };
+                if let Ok(c) = LoadCursorW(None, cursor) {
+                    SetCursor(Some(c));
+                }
+            }
+            WM_LBUTTONDOWN => {
+                let (x, y) = punto(lparam);
+                a.raton = (x as f32 / a.escala, y as f32 / a.escala);
+                SetCapture(hwnd);
+                let accion = a.zona_en(a.raton.0, a.raton.1);
+                a.pulsada = accion;
+                match accion {
+                    Some(Accion::Deslizador(d)) => {
+                        a.arrastre = Some(d);
+                        a.poner_deslizador(d, a.raton.0);
                     }
-                    (ID_SUBIR, _) => a.mover(-1),
-                    (ID_BAJAR, _) => a.mover(1),
-                    (ID_QUITAR, _) => a.quitar(),
-                    (ID_APLICAR, _) => a.aplicar(),
-                    (ID_NUEVO, _) => a.nuevo(),
-                    // Enter (IsDialogMessage lo convierte en IDOK): en el buscador o en la lista
-                    // de apps agrega; en el formulario guarda.
-                    (1, _) => {
-                        let foco = GetFocus();
-                        if foco == a.c.buscar || foco == a.c.apps {
-                            a.agregar_apps();
-                        } else if [a.c.nombre, a.c.destino, a.c.args].contains(&foco) {
-                            a.aplicar();
+                    Some(Accion::Campo(id)) => {
+                        a.foco = Some(id);
+                        a.cursor_visible = true;
+                        a.cursor_en(id, a.raton.0);
+                    }
+                    _ => a.foco = None,
+                }
+                a.invalidar();
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                if a.arrastre.take().is_some() {
+                    a.guardar();
+                } else {
+                    let accion = a.zona_en(a.raton.0, a.raton.1);
+                    if let Some(acc) = accion.filter(|x| Some(*x) == a.pulsada) {
+                        if !matches!(acc, Accion::Campo(_)) {
+                            diferida = a.ejecutar(acc);
                         }
                     }
-                    // Escape cierra la ventana.
-                    (2, _) => {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                    _ => return false,
                 }
-                true
+                a.pulsada = None;
+                a.hover = a.zona_en(a.raton.0, a.raton.1);
+                a.invalidar();
             }
-            WM_NOTIFY => {
-                let cab = &*(lparam.0 as *const NMHDR);
-                match (cab.idFrom as i32, cab.code) {
-                    (ID_APPS, LVN_ITEMACTIVATE) => a.agregar_apps(),
-                    (ID_ACCESOS, LVN_ITEMCHANGED) => {
-                        let nm = &*(lparam.0 as *const NMLISTVIEW);
-                        let seleccion = LVIS_SELECTED.0;
-                        if nm.uChanged.0 & LVIF_STATE.0 != 0 && (nm.uNewState ^ nm.uOldState) & seleccion != 0 {
-                            a.mostrar_formulario(a.seleccion_accesos());
-                        }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                let mut pt = POINT { x: punto(lparam).0, y: punto(lparam).1 };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let (x, y) = (pt.x as f32 / a.escala, pt.y as f32 / a.escala);
+                if a.selector.is_some() {
+                    if dentro(&a.area_sel, x, y) {
+                        a.scroll_sel = (a.scroll_sel - delta * CELDA * 2.0).clamp(0.0, a.max_sel);
                     }
-                    _ => return false,
+                } else if dentro(&a.area_apps, x, y) && a.seccion == Seccion::Accesos {
+                    a.scroll_apps = (a.scroll_apps - delta * FILA_APP * 3.0).clamp(0.0, a.max_apps);
+                } else if dentro(&a.area_accesos, x, y) && a.seccion == Seccion::Accesos {
+                    a.scroll_accesos = (a.scroll_accesos - delta * FILA_ACCESO * 2.0).clamp(0.0, a.max_accesos);
                 }
-                true
+                a.hover = a.zona_en(a.raton.0, a.raton.1);
+                a.invalidar();
             }
-            _ => false,
+            WM_CHAR => {
+                diferida = a.caracter(wparam.0 as u16);
+                a.invalidar();
+            }
+            WM_KEYDOWN => {
+                if !a.tecla(wparam.0 as u16) {
+                    return false;
+                }
+                a.invalidar();
+            }
+            _ => return false,
         }
+        true
     });
+    if let Some(d) = diferida.take() {
+        hacer(d, hwnd);
+    }
     if manejado == Some(true) {
-        return LRESULT(0);
+        // WM_SETCURSOR tiene que decir que ya puso el cursor.
+        return LRESULT(if msg == WM_SETCURSOR { 1 } else { 0 });
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn campo_inserta_y_borra_con_acentos() {
+        let mut c = Campo::default();
+        c.insertar("canción");
+        assert_eq!(c.cursor, 7);
+        c.mover(-1);
+        c.borrar_atras();
+        assert_eq!(c.texto, "cancin");
+        assert_eq!(c.cursor, 5);
+    }
+
+    #[test]
+    fn campo_cursor_y_seleccion() {
+        let mut c = Campo::default();
+        c.poner("hola");
+        c.ir(0);
+        c.insertar("¡");
+        assert_eq!(c.texto, "¡hola");
+        assert_eq!(c.cursor_utf16(), 1);
+        c.todo = true;
+        c.insertar("chau");
+        assert_eq!(c.texto, "chau");
+        c.ir(usize::MAX);
+        c.borrar_delante();
+        assert_eq!(c.texto, "chau");
+        c.borrar_atras();
+        assert_eq!(c.texto, "cha");
+    }
+
+    #[test]
+    fn campo_pegar_quita_saltos_de_linea() {
+        let mut c = Campo::default();
+        c.insertar("a\r\nb");
+        assert_eq!(c.texto, "a  b");
+    }
+
+    #[test]
+    fn cursor_utf16_cuenta_pares_sustitutos() {
+        let mut c = Campo::default();
+        // U+10348 (letra gótica): fuera del plano básico, ocupa dos unidades UTF-16.
+        c.poner("a\u{10348}b");
+        assert_eq!(c.cursor_utf16(), 4);
+    }
 }

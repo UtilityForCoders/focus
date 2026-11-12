@@ -1,33 +1,41 @@
 //! Focus: lanzador radial para Windows.
 //!
-//! Mantén pulsado el botón central del ratón en cualquier sitio, apunta hacia un acceso y suelta.
-//! Un clic central corto se reenvía tal cual, así que abrir enlaces en otra pestaña sigue
-//! funcionando.
+//! Mantén pulsado el botón central del ratón (o uno lateral, según los ajustes) en cualquier
+//! sitio, apunta hacia un acceso y suelta. Un clic corto se reenvía tal cual, así que abrir
+//! enlaces en otra pestaña sigue funcionando.
 //!
 //! Todo ocurre en un solo hilo: los ganchos de entrada, la ventana de la rueda y el ícono de la
 //! bandeja comparten el bucle de mensajes del hilo principal.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Un brazo de `match` que nombra una constante que no está importada no es un error: Rust lo lee
+// como una variable nueva que atrapa cualquier valor y deja muertos los brazos de debajo. En un
+// procedimiento de ventana eso es una ventana que pinta bien y no responde a nada (pasó con
+// `WM_MOUSELEAVE`, que vive en `UI::Controls`). Así deja de compilar en lugar de ser un aviso.
+#![deny(unreachable_patterns)]
 
 mod apps;
+mod autostart;
 mod config;
 mod hook;
 mod icons;
 mod launch;
+mod lucide;
+mod lucide_datos;
 mod render;
 mod settings;
 mod tray;
+mod ui;
+mod web;
 mod wheel;
 
-use config::{AbrirEn, Config};
+use config::{AbrirEn, Boton, Config};
 use hook::*;
-use icons::{Icono, Iconos};
+use icons::Visual;
 use render::{Escena, Renderer};
 use std::cell::RefCell;
-use std::rc::Rc;
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
 use std::sync::atomic::Ordering;
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use std::time::Instant;
 use windows::core::{w, Result};
 use windows::Win32::Foundation::*;
@@ -62,8 +70,7 @@ struct App {
     cfg: Config,
     nombres: Vec<String>,
     /// Ícono de cada acceso, en el mismo orden que `nombres`.
-    iconos: Vec<Option<Rc<Icono>>>,
-    cache_iconos: Iconos,
+    iconos: Vec<Option<Visual>>,
     renderer: Renderer,
     pulsado_en: POINT,
     rueda: Option<Rueda>,
@@ -75,8 +82,8 @@ impl App {
     fn recargar(&mut self) {
         self.cfg = config::cargar();
         self.nombres = self.cfg.accesos.iter().map(|x| x.nombre.clone()).collect();
-        let destinos: Vec<String> = self.cfg.accesos.iter().map(|x| x.destino.clone()).collect();
-        self.iconos = destinos.iter().map(|d| self.cache_iconos.obtener(d)).collect();
+        self.iconos = self.cfg.accesos.iter().map(icons::visual).collect();
+        hook::poner_boton(self.cfg.boton);
     }
 }
 
@@ -105,11 +112,6 @@ fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         // COM de un solo hilo: lo piden el shell (íconos, ShellExecute) y los diálogos.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let controles = INITCOMMONCONTROLSEX {
-            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
-        };
-        let _ = InitCommonControlsEx(&controles);
 
         let instancia: HINSTANCE = GetModuleHandleW(None)?.into();
         let clase = WNDCLASSW {
@@ -143,7 +145,6 @@ fn main() -> Result<()> {
             cfg: Config::default(),
             nombres: Vec::new(),
             iconos: Vec::new(),
-            cache_iconos: Iconos::default(),
             renderer: Renderer::nuevo().expect("no se pudo iniciar Direct2D"),
             pulsado_en: POINT::default(),
             rueda: None,
@@ -153,6 +154,7 @@ fn main() -> Result<()> {
 
         tray::agregar(hwnd);
         hook::instalar(hwnd)?;
+        web::poner_aviso(hwnd);
 
         // `focus --demo`: abre la rueda bajo el puntero durante unos segundos sin pulsar nada.
         // Sirve para revisar el dibujo (el gancho ignora los clics simulados con SendInput).
@@ -171,12 +173,6 @@ fn main() -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // Tab, Enter y Escape en la ventana de configuración.
-            if let Some(ajustes) = settings::ventana() {
-                if IsDialogMessageW(ajustes, &msg).as_bool() {
-                    continue;
-                }
-            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -198,6 +194,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 app.recargar();
             });
         }
+        web::WM_FOCUS_FAVICON => {
+            // Llegó un favicon: se releen los íconos web en la rueda y en los ajustes.
+            icons::olvidar_webs();
+            con_app(App::recargar);
+            settings::refrescar();
+        }
         settings::WM_FOCUS_CONFIG => {
             // La ventana de configuración guardó: se precargan los íconos nuevos ya, para que
             // la próxima rueda no tenga que esperar por ellos.
@@ -207,7 +209,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_MANTENER);
             }
-            reenviar_clic_central();
+            reenviar_clic(hook::boton());
         }
         WM_FOCUS_RELEASE => {
             let elegido = con_app(|app| {
@@ -259,6 +261,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             nombre: String::new(),
                             destino: "notepad.exe".into(),
                             argumentos: Some(format!("\"{}\"", ruta.display())),
+                            icono: None,
                         });
                     }
                     tray::CMD_CARPETA => {
@@ -267,6 +270,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 nombre: String::new(),
                                 destino: dir.display().to_string(),
                                 argumentos: None,
+                                icono: None,
                             });
                         }
                     }
@@ -283,15 +287,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     LRESULT(0)
 }
 
-/// Un clic central corto no era para Focus: se devuelve al sistema como si nada.
-fn reenviar_clic_central() {
-    let evento = |flags| INPUT {
+/// Un clic corto no era para Focus: se devuelve al sistema como si nada (el gancho deja pasar
+/// los eventos inyectados).
+fn reenviar_clic(boton: Boton) {
+    let evento = |flags, datos: u16| INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            mi: MOUSEINPUT { dwFlags: flags, ..Default::default() },
+            mi: MOUSEINPUT { dwFlags: flags, mouseData: datos as u32, ..Default::default() },
         },
     };
-    let entradas = [evento(MOUSEEVENTF_MIDDLEDOWN), evento(MOUSEEVENTF_MIDDLEUP)];
+    let entradas = match boton {
+        Boton::Central => [evento(MOUSEEVENTF_MIDDLEDOWN, 0), evento(MOUSEEVENTF_MIDDLEUP, 0)],
+        Boton::Atras => [evento(MOUSEEVENTF_XDOWN, XBUTTON1), evento(MOUSEEVENTF_XUP, XBUTTON1)],
+        Boton::Adelante => [evento(MOUSEEVENTF_XDOWN, XBUTTON2), evento(MOUSEEVENTF_XUP, XBUTTON2)],
+    };
     unsafe {
         SendInput(&entradas, std::mem::size_of::<INPUT>() as i32);
     }
@@ -305,7 +314,8 @@ fn abrir(app: &mut App) {
         let _ = GetMonitorInfoW(monitor, &mut info);
         let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
-        let escala = dpi_x as f32 / 96.0;
+        // El tamaño elegido en los ajustes se aplica como una escala más.
+        let escala = dpi_x as f32 / 96.0 * app.cfg.tamano;
 
         let m = info.rcMonitor;
         let (ancho, alto) = (m.right - m.left, m.bottom - m.top);
@@ -313,7 +323,7 @@ fn abrir(app: &mut App) {
             AbrirEn::Centro => (ancho as f32 / 2.0, alto as f32 / 2.0),
             AbrirEn::Cursor => {
                 // Bajo el puntero, pero sin que la rueda se salga del monitor.
-                let margen = (wheel::RADIO_EXTERIOR + 12.0) * escala;
+                let margen = wheel::alcance(app.nombres.len()) * escala;
                 let limitar = |v: f32, max: f32| if max <= 2.0 * margen { max / 2.0 } else { v.clamp(margen, max - margen) };
                 (limitar((p.x - m.left) as f32, ancho as f32), limitar((p.y - m.top) as f32, alto as f32))
             }
@@ -355,7 +365,7 @@ fn actualizar(app: &mut App) {
     }
     let dx = (p.x - r.origen.x) as f32 - r.centro.0;
     let dy = (p.y - r.origen.y) as f32 - r.centro.1;
-    let seleccion = wheel::sector_en(dx, dy, n, wheel::RADIO_INTERIOR * r.escala);
+    let seleccion = wheel::sector_en(dx, dy, n, app.cfg.zona_central * r.escala);
 
     let t = (r.inicio.elapsed().as_secs_f32() * 1000.0 / APERTURA_MS).min(1.0);
     let progreso = 1.0 - (1.0 - t).powi(3); // ease-out cúbico
@@ -380,6 +390,8 @@ fn pintar(app: &mut App) {
         iconos: &app.iconos,
         seleccion: r.seleccion,
         progreso: r.progreso,
+        oscurecer: app.cfg.oscurecer,
+        radio_central: app.cfg.zona_central * r.escala,
     };
     if let Err(e) = app.renderer.dibujar(&escena) {
         eprintln!("dibujar: {e}");

@@ -9,7 +9,8 @@
 //! varios (unos 250 elementos en un equipo normal). Por eso se hace en un hilo aparte y en dos
 //! pasos: primero se envía la lista con los nombres, y después los íconos por tandas.
 
-use crate::icons;
+use crate::icons::{self, Icono, IconoRef};
+use std::sync::Arc;
 use std::sync::Mutex;
 use windows::core::{w, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -17,16 +18,19 @@ use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHR
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppInstalada {
     pub nombre: String,
     /// Listo para usar como destino de un acceso: `shell:AppsFolder\<id>`.
     pub destino: String,
-    /// Índice en la lista de imágenes del sistema; -1 mientras no se conoce.
-    pub icono: i32,
+    /// Ícono pequeño para la lista; `None` mientras no ha llegado (o si la app no tiene).
+    pub icono: Option<IconoRef>,
 }
 
 /// Última lista completa (con íconos), para que reabrir la ventana sea instantáneo.
+/// Lado de los íconos de la lista: 24 px lógicos hasta 200 % de escala, y algo más.
+const LADO_LISTA: i32 = 56;
+
 static CACHE: Mutex<Option<Vec<AppInstalada>>> = Mutex::new(None);
 
 pub fn en_cache() -> Option<Vec<AppInstalada>> {
@@ -34,7 +38,7 @@ pub fn en_cache() -> Option<Vec<AppInstalada>> {
 }
 
 /// `lParam` de `msg_lista`: `Box<Vec<AppInstalada>>`.
-/// `lParam` de `msg_iconos`: `Box<Vec<(usize, i32)>>` con (posición en la lista, ícono).
+/// `lParam` de `msg_iconos`: `Box<Vec<(usize, Option<IconoRef>)>>` con (posición, ícono).
 /// Quien recibe los mensajes se queda con la caja (`Box::from_raw`).
 pub fn cargar_en_segundo_plano(ventana: HWND, msg_lista: u32, msg_iconos: u32) {
     let ventana = ventana.0 as isize;
@@ -62,15 +66,16 @@ pub fn cargar_en_segundo_plano(ventana: HWND, msg_lista: u32, msg_iconos: u32) {
 
         let mut completa = Vec::with_capacity(elementos.len());
         let mut tanda = Vec::new();
-        let enviar_tanda = |tanda: Vec<(usize, i32)>| {
+        let enviar_tanda = |tanda: Vec<(usize, Option<IconoRef>)>| {
             let caja = Box::into_raw(Box::new(tanda)) as isize;
             if !enviar(msg_iconos, caja) {
-                drop(unsafe { Box::from_raw(caja as *mut Vec<(usize, i32)>) });
+                drop(unsafe { Box::from_raw(caja as *mut Vec<(usize, Option<IconoRef>)>) });
             }
         };
         for (i, (mut app, item)) in elementos.into_iter().enumerate() {
-            app.icono = indice_de(&item);
-            tanda.push((i, app.icono));
+            app.icono = icons::de_item(&item, LADO_LISTA, SIIGBF_ICONONLY | SIIGBF_RESIZETOFIT)
+                .map(|(ancho, alto, pixeles)| Arc::new(Icono::nuevo(format!("lista:{}", app.destino), ancho, alto, pixeles)));
+            tanda.push((i, app.icono.clone()));
             completa.push(app);
             if tanda.len() == 24 {
                 enviar_tanda(std::mem::take(&mut tanda));
@@ -119,23 +124,10 @@ fn recorrer() -> Vec<(AppInstalada, IShellItem)> {
             if nombre.is_empty() || id.is_empty() {
                 continue;
             }
-            apps.push((AppInstalada { nombre, destino: format!("shell:AppsFolder\\{id}"), icono: -1 }, item));
+            apps.push((AppInstalada { nombre, destino: format!("shell:AppsFolder\\{id}"), icono: None }, item));
         }
     }
     apps
-}
-
-fn indice_de(item: &IShellItem) -> i32 {
-    unsafe {
-        match SHGetIDListFromObject(item) {
-            Ok(pidl) => {
-                let i = icons::indice_de_pidl(pidl);
-                CoTaskMemFree(Some(pidl as *const _));
-                i
-            }
-            Err(_) => -1,
-        }
-    }
 }
 
 /// ¿Coincide la app con el texto de búsqueda? Cada palabra tiene que aparecer en el nombre.
@@ -149,7 +141,7 @@ mod tests {
     use super::*;
 
     fn app(nombre: &str) -> AppInstalada {
-        AppInstalada { nombre: nombre.into(), destino: format!("shell:AppsFolder\\{nombre}"), icono: 0 }
+        AppInstalada { nombre: nombre.into(), destino: format!("shell:AppsFolder\\{nombre}"), icono: None }
     }
 
     #[test]

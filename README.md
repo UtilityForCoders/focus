@@ -2,8 +2,9 @@
 
 Lanzador radial para Windows 10 y 11, escrito en Rust puro (Win32 + Direct2D).
 
-Mantén pulsado el **botón central del ratón** en cualquier sitio: aparece una rueda con tus
-accesos. Apunta hacia uno y suelta para abrirlo. Si sueltas en el círculo central o pulsas
+Mantén pulsado el **botón central del ratón** (o uno lateral, según los ajustes) en cualquier
+sitio: aparece una rueda de baldosas con los iconos de tus accesos. Apunta hacia uno y suelta
+para abrirlo. Si sueltas en el círculo central o pulsas
 **Escape**, se cancela. Un clic central corto se reenvía tal cual, así que abrir enlaces en otra
 pestaña sigue funcionando.
 
@@ -30,20 +31,49 @@ cargo run -- --ajustes
 
 Abre la ventana de configuración al arrancar.
 
-## Configurar los accesos
+## Ajustes
 
-La ventana de configuración tiene dos columnas:
+Una ventana oscura con fondo acrílico (Windows 11), dibujada con Direct2D, con estas secciones:
+
+- **General**: dónde aparece la rueda (bajo el puntero o en el centro), el retardo y si Focus
+  se inicia con Windows.
+- **Activación**: qué botón abre la rueda (central, lateral atrás o lateral adelante) y el
+  tamaño de la zona central para cancelar.
+- **Apariencia**: tamaño de la rueda y oscurecer el fondo, con una vista previa en vivo.
+- **Accesos**: qué apps aparecen en la rueda (ver abajo).
+- **Acerca de**: versión y archivo de configuración.
+
+### Accesos
+
+La sección tiene dos columnas:
 
 - **Aplicaciones instaladas**: todas las apps del menú Inicio, también las de la Microsoft
-  Store, con su ícono. Escribe en el buscador y pulsa **Enter** (o haz doble clic, o usa
-  **Agregar a la rueda**) para añadirla.
-- **Accesos en la rueda**: en el orden en que aparecen, empezando arriba y en el sentido de
-  las agujas del reloj. **Subir**, **Bajar** y **Quitar** cambian el orden. El formulario de
-  abajo sirve para renombrar un acceso o crear uno propio (una carpeta, una URL, un comando);
-  **Examinar…** elige un archivo o un acceso directo.
+  Store, con su ícono. Haz clic en una para añadirla, o escribe en el buscador y pulsa
+  **Enter** para añadir la primera que coincida.
+- **En la rueda**: en el orden en que aparecen, empezando arriba y en el sentido de las agujas
+  del reloj. Al pasar el ratón por una fila aparecen los botones para subir, bajar o quitar. El
+  editor de abajo sirve para renombrar un acceso o crear uno propio (una carpeta, una URL, un
+  comando); el botón de carpeta elige un archivo o un acceso directo.
 
-Cada cambio se guarda al momento y vale desde la siguiente pulsación. La rueda muestra el
-ícono de cada acceso tal como lo da Windows; las URLs usan el del navegador predeterminado.
+Cada cambio se guarda al momento y vale desde la siguiente pulsación.
+
+### Íconos
+
+Cada acceso usa su ícono automático, salvo que elijas otro con **Elegir…** en el editor:
+
+- **Apps, programas, carpetas y archivos**: el ícono que da Windows, pedido a 256 px. Se prueban
+  dos variantes y se queda la que no tenga halo blanco (el borde claro que deja un ícono
+  recortado sobre fondo blanco).
+- **Webs**: el favicon del sitio. Se descarga una vez en segundo plano (solo se envía el nombre
+  del host al servicio de favicons de Google, o al de DuckDuckGo si falla) y se guarda en
+  `%APPDATA%\Focus\favicons`. Mientras no llega, se usa el ícono del navegador.
+- **Lucide**: 1.891 íconos de línea, con buscador (las palabras clave están en inglés).
+- **Archivo**: cualquier ícono de un `.dll`, `.exe` o `.ico`; por defecto se abre
+  `shell32.dll`, con más de 300.
+
+En `config.json` el ícono elegido se guarda como `"icono": "lucide:music"` o
+`"icono": "archivo:%SystemRoot%\\System32\\shell32.dll,31"` (las barras van dobles dentro del
+JSON).
 
 ## config.json
 
@@ -65,7 +95,11 @@ puede editar a mano: se crea con ejemplos la primera vez y se relee en cada puls
 ```
 
 - `abrir_en`: `cursor` (bajo el puntero) o `centro` (centro del monitor).
-- `retardo_ms`: cuánto hay que mantener el botón para que salga la rueda (50 a 1000).
+- `retardo_ms`: cuánto hay que mantener el botón para que salga la rueda (80 a 600).
+- `boton`: `central`, `atras` o `adelante`.
+- `tamano`: escala de la rueda (0.8 a 1.4).
+- `zona_central`: radio del círculo para cancelar, en píxeles (20 a 60).
+- `oscurecer`: `true` o `false`.
 - `destino`: programa, carpeta, archivo, URL o URI. Acepta variables `%VAR%`. Las apps
   agregadas desde la lista usan `shell:AppsFolder\<id>`, que funciona igual para programas de
   escritorio y apps de la Store.
@@ -75,12 +109,32 @@ puede editar a mano: se crea con ejemplos la primera vez y se relee en cada puls
 | Módulo | Qué hace |
 |---|---|
 | `main.rs` | Ventana de la rueda, bucle de mensajes, abrir/cerrar y animación |
-| `hook.rs` | Ganchos globales `WH_MOUSE_LL` / `WH_KEYBOARD_LL` |
+| `hook.rs` | Ganchos globales `WH_MOUSE_LL` / `WH_KEYBOARD_LL`, botón configurable |
 | `wheel.rs` | Geometría: qué sector cae bajo el puntero |
-| `render.rs` | Dibujo con Direct2D y DirectWrite sobre una ventana layered |
-| `settings.rs` | Ventana de configuración de accesos (controles nativos de Windows) |
+| `render.rs` | La rueda de baldosas, sobre una ventana layered (y en la vista previa) |
+| `settings.rs` | Ventana de ajustes: barra lateral, secciones, listas y campos de texto propios |
+| `ui.rs` | Kit de dibujo compartido: tema oscuro, formas, texto, glifos de Segoe Fluent Icons |
+| `autostart.rs` | Iniciar con Windows (clave `Run` del usuario) |
 | `apps.rs` | Lista de apps instaladas desde `shell:AppsFolder`, en segundo plano |
-| `icons.rs` | Íconos del shell: píxeles para la rueda e índices para las listas |
+| `icons.rs` | Íconos: shell a 256 px sin halo, favicons, íconos de archivos, WIC y caché |
+| `web.rs` | Descarga de favicons con WinHTTP y caché en disco |
+| `lucide.rs` | Búsqueda de íconos Lucide y lectura de sus trazos SVG |
+| `lucide_datos.rs` | Datos de Lucide, generados por `scripts/generar_lucide.py` |
 | `config.rs` | Lectura, escritura y valores por defecto de `config.json` |
 | `launch.rs` | Abrir accesos con `ShellExecuteW` |
 | `tray.rs` | Ícono y menú del área de notificación |
+
+## Licencias de terceros
+
+Los íconos de [Lucide](https://lucide.dev) se distribuyen bajo licencia ISC; el texto completo
+está en [licencias/LUCIDE.txt](licencias/LUCIDE.txt). Para actualizarlos:
+
+```bash
+npm pack lucide-static@<versión>
+```
+
+Extrae el `.tgz` y ejecuta:
+
+```bash
+python -I scripts/generar_lucide.py package/icon-nodes.json package/tags.json src/lucide_datos.rs
+```

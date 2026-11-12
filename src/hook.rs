@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use crate::config::Boton;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -56,14 +57,50 @@ pub fn desempaquetar(l: isize) -> (i32, i32) {
     ((l as u32 & 0xFFFF) as u16 as i16 as i32, ((l as u32 >> 16) & 0xFFFF) as u16 as i16 as i32)
 }
 
+/// Botón que abre la rueda: 0 central, 1 lateral "atrás", 2 lateral "adelante".
+static BOTON: AtomicU8 = AtomicU8::new(0);
+
+pub fn poner_boton(boton: Boton) {
+    let v = match boton {
+        Boton::Central => 0,
+        Boton::Atras => 1,
+        Boton::Adelante => 2,
+    };
+    BOTON.store(v, Ordering::Relaxed);
+}
+
+pub fn boton() -> Boton {
+    match BOTON.load(Ordering::Relaxed) {
+        1 => Boton::Atras,
+        2 => Boton::Adelante,
+        _ => Boton::Central,
+    }
+}
+
+/// ¿Es este mensaje del ratón el botón configurado? Devuelve `Some(true)` al pulsarlo,
+/// `Some(false)` al soltarlo y `None` si es otro botón.
+fn es_el_boton(msg: u32, datos: u32) -> Option<bool> {
+    // En los botones laterales, la palabra alta de `mouseData` dice cuál es (1 o 2).
+    let lateral = (datos >> 16) as u16;
+    match (BOTON.load(Ordering::Relaxed), msg) {
+        (0, WM_MBUTTONDOWN) => Some(true),
+        (0, WM_MBUTTONUP) => Some(false),
+        (1, WM_XBUTTONDOWN) if lateral == XBUTTON1 => Some(true),
+        (1, WM_XBUTTONUP) if lateral == XBUTTON1 => Some(false),
+        (2, WM_XBUTTONDOWN) if lateral == XBUTTON2 => Some(true),
+        (2, WM_XBUTTONUP) if lateral == XBUTTON2 => Some(false),
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         // Los eventos inyectados (incluido el clic que Focus reenvía) pasan sin tocar.
         let inyectado = info.flags & LLMHF_INJECTED != 0;
         if !inyectado {
-            match wparam.0 as u32 {
-                WM_MBUTTONDOWN => {
+            match es_el_boton(wparam.0 as u32, info.mouseData) {
+                Some(true) => {
                     if ESTADO
                         .compare_exchange(INACTIVO, PENDIENTE, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
@@ -72,7 +109,7 @@ unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                         return LRESULT(1);
                     }
                 }
-                WM_MBUTTONUP => match ESTADO.swap(INACTIVO, Ordering::SeqCst) {
+                Some(false) => match ESTADO.swap(INACTIVO, Ordering::SeqCst) {
                     PENDIENTE => {
                         avisar(WM_FOCUS_TAP, 0);
                         return LRESULT(1);
@@ -84,7 +121,7 @@ unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                     CANCELADA => return LRESULT(1),
                     _ => {}
                 },
-                _ => {}
+                None => {}
             }
         }
     }
