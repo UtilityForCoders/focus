@@ -5,8 +5,11 @@
 //! Todo se mide en píxeles físicos: la escala del monitor llega en `Escena::escala` y se aplica a
 //! las medidas, no al render target (que trabaja a 96 ppp).
 
+use crate::icons::Icono;
 use crate::wheel::{self, HUECO, RADIO_EXTERIOR, RADIO_INTERIOR};
+use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
+use std::rc::Rc;
 use windows::core::{w, Result};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -22,6 +25,8 @@ pub struct Escena<'a> {
     pub centro: (f32, f32),
     pub escala: f32,
     pub nombres: &'a [String],
+    /// Ícono de cada acceso (mismo orden que `nombres`); sin ícono se dibuja solo el texto.
+    pub iconos: &'a [Option<Rc<Icono>>],
     pub seleccion: Option<usize>,
     /// Progreso de la animación de apertura, de 0 a 1 (ya suavizado).
     pub progreso: f32,
@@ -32,7 +37,9 @@ pub struct Renderer {
     dwrite: IDWriteFactory,
     target: Option<ID2D1DCRenderTarget>,
     /// Formatos de texto creados para una escala concreta (cambian al pasar a otro monitor).
-    textos: Option<(f32, IDWriteTextFormat, IDWriteTextFormat)>,
+    textos: Option<(f32, IDWriteTextFormat, IDWriteTextFormat, IDWriteTextFormat)>,
+    /// Bitmaps de Direct2D por destino. Pertenecen al render target: se vacía al recrearlo.
+    bitmaps: HashMap<String, ID2D1Bitmap>,
     dc: HDC,
     bitmap: HBITMAP,
     anterior: HGDIOBJ,
@@ -51,6 +58,8 @@ const BORDE: D2D1_COLOR_F = color(255, 255, 255, 0.10);
 const CENTRO: D2D1_COLOR_F = color(16, 17, 21, 0.97);
 const TEXTO: D2D1_COLOR_F = color(236, 238, 244, 1.0);
 const TEXTO_TENUE: D2D1_COLOR_F = color(150, 154, 166, 1.0);
+/// Lado del ícono de cada sector, en píxeles lógicos.
+const ICONO: f32 = 40.0;
 
 impl Renderer {
     pub fn nuevo() -> Result<Self> {
@@ -63,6 +72,7 @@ impl Renderer {
                 dwrite,
                 target: None,
                 textos: None,
+                bitmaps: HashMap::new(),
                 dc,
                 bitmap: HBITMAP::default(),
                 anterior: HGDIOBJ::default(),
@@ -126,13 +136,40 @@ impl Renderer {
         };
         let t = unsafe { self.factory.CreateDCRenderTarget(&props)? };
         self.target = Some(t.clone());
+        self.bitmaps.clear();
         Ok(t)
     }
 
-    fn formatos(&mut self, escala: f32) -> Result<(IDWriteTextFormat, IDWriteTextFormat)> {
-        if let Some((e, a, b)) = &self.textos {
+    fn bitmap(&mut self, target: &ID2D1DCRenderTarget, icono: &Icono) -> Option<ID2D1Bitmap> {
+        if let Some(b) = self.bitmaps.get(&icono.clave) {
+            return Some(b.clone());
+        }
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let b = unsafe {
+            target
+                .CreateBitmap(
+                    D2D_SIZE_U { width: icono.ancho, height: icono.alto },
+                    Some(icono.pixeles.as_ptr().cast()),
+                    icono.ancho * 4,
+                    &props,
+                )
+                .ok()?
+        };
+        self.bitmaps.insert(icono.clave.clone(), b.clone());
+        Some(b)
+    }
+
+    fn formatos(&mut self, escala: f32) -> Result<(IDWriteTextFormat, IDWriteTextFormat, IDWriteTextFormat)> {
+        if let Some((e, a, b, c)) = &self.textos {
             if (*e - escala).abs() < 0.01 {
-                return Ok((a.clone(), b.clone()));
+                return Ok((a.clone(), b.clone(), c.clone()));
             }
         }
         let crear = |tam: f32, peso: DWRITE_FONT_WEIGHT| -> Result<IDWriteTextFormat> {
@@ -154,8 +191,16 @@ impl Renderer {
         };
         let sector = crear(13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
         let centro = crear(12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
-        self.textos = Some((escala, sector.clone(), centro.clone()));
-        Ok((sector, centro))
+        // Bajo el ícono: una sola línea, recortada con "…" si no cabe.
+        let icono = crear(11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+        unsafe {
+            icono.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let elipsis = self.dwrite.CreateEllipsisTrimmingSign(&icono)?;
+            let recorte = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+            icono.SetTrimming(&recorte, &elipsis)?;
+        }
+        self.textos = Some((escala, sector.clone(), centro.clone(), icono.clone()));
+        Ok((sector, centro, icono))
     }
 
     /// Pinta la escena en el DIB. Después, el DIB está listo para `UpdateLayeredWindow`.
@@ -170,7 +215,7 @@ impl Renderer {
 
     fn dibujar_en(&mut self, e: &Escena) -> Result<()> {
         let target = self.target()?;
-        let (fmt_sector, fmt_centro) = self.formatos(e.escala)?;
+        let (fmt_sector, fmt_centro, fmt_icono) = self.formatos(e.escala)?;
         let rect = RECT { left: 0, top: 0, right: self.ancho, bottom: self.alto };
         unsafe {
             target.BindDC(self.dc, &rect)?;
@@ -215,22 +260,30 @@ impl Renderer {
                     target.DrawGeometry(&geo, &pincel, 1.0, None);
                 }
 
-                // Etiqueta en el radio medio del sector.
+                // Ícono y nombre en el radio medio del sector. Sin ícono, solo el nombre.
                 let a = wheel::angulo_centro(i, n);
                 let r = (ext + int) / 2.0;
                 let (tx, ty) = (cx + r * a.cos(), cy + r * a.sin());
-                let (mw, mh) = (54.0 * e.escala, 24.0 * e.escala);
-                let caja = D2D_RECT_F { left: tx - mw, top: ty - mh, right: tx + mw, bottom: ty + mh };
+                let bitmap = e.iconos.get(i).and_then(|x| x.as_ref()).and_then(|ic| self.bitmap(&target, ic));
+                let mw = 54.0 * e.escala;
+                let caja = match &bitmap {
+                    Some(b) => {
+                        let lado = ICONO * e.escala;
+                        let arriba = ty - lado / 2.0 - 9.0 * e.escala;
+                        let destino = D2D_RECT_F { left: tx - lado / 2.0, top: arriba, right: tx + lado / 2.0, bottom: arriba + lado };
+                        target.DrawBitmap(b, Some(&destino), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                        let y = arriba + lado + 2.0 * e.escala;
+                        D2D_RECT_F { left: tx - mw, top: y, right: tx + mw, bottom: y + 18.0 * e.escala }
+                    }
+                    None => {
+                        let mh = 24.0 * e.escala;
+                        D2D_RECT_F { left: tx - mw, top: ty - mh, right: tx + mw, bottom: ty + mh }
+                    }
+                };
                 pincel.SetColor(&TEXTO);
                 let texto: Vec<u16> = e.nombres[i].encode_utf16().collect();
-                target.DrawText(
-                    &texto,
-                    &fmt_sector,
-                    &caja,
-                    &pincel,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                let fmt = if bitmap.is_some() { &fmt_icono } else { &fmt_sector };
+                target.DrawText(&texto, fmt, &caja, &pincel, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
             }
 
             // Centro: muestra el acceso elegido, o cómo cancelar.

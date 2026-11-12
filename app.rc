@@ -1,0 +1,3 @@
+// Recursos del ejecutable.
+// Manifiesto (24 = RT_MANIFEST): controles modernos de Windows y DPI por monitor, ver app.manifest.
+1 24 "app.manifest"

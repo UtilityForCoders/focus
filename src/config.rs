@@ -16,7 +16,7 @@ pub enum AbrirEn {
     Centro,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Acceso {
     /// Texto que se ve en el sector.
     pub nombre: String,
@@ -100,6 +100,16 @@ pub fn cargar() -> Config {
             cfg
         }
     }
+}
+
+/// Escribe la configuración en disco (la usa la ventana de configuración).
+pub fn guardar(cfg: &Config) -> std::io::Result<()> {
+    let ruta = ruta();
+    if let Some(dir) = ruta.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(std::io::Error::other)?;
+    std::fs::write(ruta, json)
 }
 
 /// Expande `%VAR%` con las variables de entorno. Una variable desconocida se deja tal cual.

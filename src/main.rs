@@ -9,17 +9,24 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod apps;
 mod config;
 mod hook;
+mod icons;
 mod launch;
 mod render;
+mod settings;
 mod tray;
 mod wheel;
 
 use config::{AbrirEn, Config};
 use hook::*;
+use icons::{Icono, Iconos};
 use render::{Escena, Renderer};
 use std::cell::RefCell;
+use std::rc::Rc;
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use windows::core::{w, Result};
@@ -54,17 +61,36 @@ struct App {
     hwnd: HWND,
     cfg: Config,
     nombres: Vec<String>,
+    /// Ícono de cada acceso, en el mismo orden que `nombres`.
+    iconos: Vec<Option<Rc<Icono>>>,
+    cache_iconos: Iconos,
     renderer: Renderer,
     pulsado_en: POINT,
     rueda: Option<Rueda>,
+}
+
+impl App {
+    /// Relee `config.json` y prepara los íconos. Los ya extraídos salen de la caché, así que
+    /// después de la primera vez esto es casi gratis.
+    fn recargar(&mut self) {
+        self.cfg = config::cargar();
+        self.nombres = self.cfg.accesos.iter().map(|x| x.nombre.clone()).collect();
+        let destinos: Vec<String> = self.cfg.accesos.iter().map(|x| x.destino.clone()).collect();
+        self.iconos = destinos.iter().map(|d| self.cache_iconos.obtener(d)).collect();
+    }
 }
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
+/// Si el estado ya está prestado (un mensaje que llega mientras se atiende otro), no se hace
+/// nada en lugar de entrar en pánico.
 fn con_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    APP.with(|a| a.borrow_mut().as_mut().map(f))
+    APP.with(|a| match a.try_borrow_mut() {
+        Ok(mut g) => g.as_mut().map(f),
+        Err(_) => None,
+    })
 }
 
 fn main() -> Result<()> {
@@ -75,7 +101,15 @@ fn main() -> Result<()> {
             return Ok(());
         }
         // Coordenadas físicas en todos los monitores: el gancho y la ventana hablan el mismo idioma.
+        // (El manifiesto ya lo pide; esto cubre ejecutar sin él.)
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // COM de un solo hilo: lo piden el shell (íconos, ShellExecute) y los diálogos.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let controles = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+        };
+        let _ = InitCommonControlsEx(&controles);
 
         let instancia: HINSTANCE = GetModuleHandleW(None)?.into();
         let clase = WNDCLASSW {
@@ -104,17 +138,18 @@ fn main() -> Result<()> {
             None,
         )?;
 
-        let cfg = config::cargar();
-        APP.with(|a| {
-            *a.borrow_mut() = Some(App {
-                hwnd,
-                nombres: cfg.accesos.iter().map(|x| x.nombre.clone()).collect(),
-                cfg,
-                renderer: Renderer::nuevo().expect("no se pudo iniciar Direct2D"),
-                pulsado_en: POINT::default(),
-                rueda: None,
-            })
-        });
+        let mut app = App {
+            hwnd,
+            cfg: Config::default(),
+            nombres: Vec::new(),
+            iconos: Vec::new(),
+            cache_iconos: Iconos::default(),
+            renderer: Renderer::nuevo().expect("no se pudo iniciar Direct2D"),
+            pulsado_en: POINT::default(),
+            rueda: None,
+        };
+        app.recargar();
+        APP.with(|a| *a.borrow_mut() = Some(app));
 
         tray::agregar(hwnd);
         hook::instalar(hwnd)?;
@@ -129,9 +164,19 @@ fn main() -> Result<()> {
             });
             SetTimer(Some(hwnd), TIMER_DEMO, 4000, None);
         }
+        // `focus --ajustes`: abre la ventana de configuración al arrancar.
+        if std::env::args().any(|a| a == "--ajustes") {
+            settings::abrir(hwnd);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // Tab, Enter y Escape en la ventana de configuración.
+            if let Some(ajustes) = settings::ventana() {
+                if IsDialogMessageW(ajustes, &msg).as_bool() {
+                    continue;
+                }
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -145,12 +190,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_FOCUS_DOWN => {
             let (x, y) = desempaquetar(lparam.0);
             con_app(|app| {
-                // Se relee en cada pulsación: los cambios en config.json valen sin reiniciar.
-                app.cfg = config::cargar();
-                app.nombres = app.cfg.accesos.iter().map(|x| x.nombre.clone()).collect();
                 app.pulsado_en = POINT { x, y };
+                // El temporizador arranca antes de releer: el tiempo de leer el archivo (y algún
+                // ícono nuevo) corre a la vez que la espera, no después.
                 unsafe { SetTimer(Some(hwnd), TIMER_MANTENER, app.cfg.retardo_ms, None) };
+                // Se relee en cada pulsación: los cambios en config.json valen sin reiniciar.
+                app.recargar();
             });
+        }
+        settings::WM_FOCUS_CONFIG => {
+            // La ventana de configuración guardó: se precargan los íconos nuevos ya, para que
+            // la próxima rueda no tenga que esperar por ellos.
+            con_app(App::recargar);
         }
         WM_FOCUS_TAP => {
             unsafe {
@@ -196,8 +247,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         },
         tray::WM_FOCUS_TRAY => {
             let evento = (lparam.0 as u32) & 0xFFFF;
-            if evento == WM_RBUTTONUP || evento == WM_LBUTTONUP {
+            if evento == WM_LBUTTONUP {
+                settings::abrir(hwnd);
+            } else if evento == WM_RBUTTONUP {
                 match tray::menu(hwnd) {
+                    tray::CMD_CONFIGURAR => settings::abrir(hwnd),
                     tray::CMD_EDITAR => {
                         let ruta = config::ruta();
                         config::cargar(); // crea el archivo si aún no existe
@@ -323,6 +377,7 @@ fn pintar(app: &mut App) {
         centro: r.centro,
         escala: r.escala,
         nombres: &app.nombres,
+        iconos: &app.iconos,
         seleccion: r.seleccion,
         progreso: r.progreso,
     };

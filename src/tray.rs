@@ -10,6 +10,7 @@ pub const WM_FOCUS_TRAY: u32 = WM_APP + 10;
 pub const CMD_EDITAR: usize = 1;
 pub const CMD_CARPETA: usize = 2;
 pub const CMD_SALIR: usize = 3;
+pub const CMD_CONFIGURAR: usize = 4;
 
 fn datos(hwnd: HWND) -> NOTIFYICONDATAW {
     let mut nid = NOTIFYICONDATAW {
@@ -18,7 +19,7 @@ fn datos(hwnd: HWND) -> NOTIFYICONDATAW {
         uID: 1,
         ..Default::default()
     };
-    let tip: Vec<u16> = "Focus: mantén el botón central".encode_utf16().collect();
+    let tip: Vec<u16> = "Focus: mantén el botón central · clic para configurar".encode_utf16().collect();
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     nid
 }
@@ -44,7 +45,11 @@ pub fn quitar(hwnd: HWND) {
 pub fn menu(hwnd: HWND) -> usize {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return 0 };
-        let _ = AppendMenuW(menu, MF_STRING, CMD_EDITAR, w!("Editar accesos"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_CONFIGURAR, w!("Configurar accesos…"));
+        // En negrita: es lo mismo que hace el clic izquierdo en el ícono.
+        let _ = SetMenuDefaultItem(menu, CMD_CONFIGURAR as u32, 0);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, CMD_EDITAR, w!("Abrir config.json"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_CARPETA, w!("Abrir carpeta de configuración"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_SALIR, w!("Salir"));
