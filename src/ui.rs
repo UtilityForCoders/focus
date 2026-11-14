@@ -135,6 +135,31 @@ impl Pintor {
         unsafe { self.rt.FillGeometry(geo, self.color(&c), None) };
     }
 
+    pub fn rellenar_geometria_gradiente(
+        &self,
+        geo: &ID2D1Geometry,
+        p0: Vector2,
+        c0: Color,
+        p1: Vector2,
+        c1: Color,
+    ) {
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c0 },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c1 },
+        ];
+        unsafe {
+            if let Ok(col) = self.rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: p0,
+                    endPoint: p1,
+                };
+                if let Ok(brush) = self.rt.CreateLinearGradientBrush(&props, None, &col) {
+                    self.rt.FillGeometry(geo, &brush, None);
+                }
+            }
+        }
+    }
+
     pub fn bordear_geometria(&self, geo: &ID2D1Geometry, c: Color, grosor: f32) {
         unsafe { self.rt.DrawGeometry(geo, self.color(&c), grosor, None) };
     }

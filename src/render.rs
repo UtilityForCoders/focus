@@ -10,7 +10,7 @@
 
 use crate::config::{Config, Grupo};
 use crate::icons::{self, Visual};
-use crate::ui::{self, glifo, rect, rgba, tema, Alin, Peso, Pintor};
+use crate::ui::{self, rect, rgba, tema, Alin, Peso, Pintor};
 use crate::wheel;
 use windows::core::{Interface, Result};
 use windows::Win32::Foundation::RECT;
@@ -86,10 +86,6 @@ pub struct Renderer {
     pub alto: i32,
 }
 
-const SEGMENTO_FONDO: ui::Color = rgba(26, 26, 32, 0.88);
-const SEGMENTO_HOVER: ui::Color = rgba(72, 64, 96, 0.92);  // violeta grisáceo
-const SEGMENTO_BORDE: ui::Color = rgba(255, 255, 255, 0.10);
-const SEGMENTO_BORDE_HOVER: ui::Color = rgba(255, 255, 255, 0.35);
 const CENTRO_FONDO: ui::Color = rgba(20, 20, 24, 0.90);
 
 impl Renderer {
@@ -197,38 +193,38 @@ impl Renderer {
     }
 }
 
-/// Dibuja un segmento de pétalo curvado con arcos y esquinas redondeadas.
-fn dibujar_segmento(
+/// Crea la geometría vectorial de un segmento de pétalo curvado con esquinas redondeadas.
+fn crear_segmento(
     factory: &ID2D1Factory,
-    p: &mut Pintor,
     cx: f32,
     cy: f32,
     ang_ini: f32,
     ang_fin: f32,
     r_int: f32,
     r_ext: f32,
-    relleno: ui::Color,
-    borde: ui::Color,
     escala: f32,
-) -> Result<()> {
+) -> Result<ID2D1PathGeometry> {
     let geo = unsafe { factory.CreatePathGeometry()? };
     let sink = unsafe { geo.Open()? };
     let v = |r: f32, a: f32| Vector2 { X: cx + r * a.cos(), Y: cy + r * a.sin() };
 
     let span = (ang_fin - ang_ini).abs();
-    let rc = (wheel::REDONDEO_ESQUINA * escala)
-        .min((r_ext - r_int) * 0.45)
-        .min(r_int * span * 0.45);
+    let rc_ext = (wheel::REDONDEO_ESQUINA * escala)
+        .min((r_ext - r_int) * 0.35)
+        .min(r_ext * span * 0.35);
+    let rc_int = (7.0 * escala)
+        .min((r_ext - r_int) * 0.25)
+        .min(r_int * span * 0.30);
 
     unsafe {
-        if rc >= 1.0 {
-            let da_ext = rc / r_ext;
-            let da_int = rc / r_int;
-            sink.BeginFigure(v(r_int + rc, ang_ini), D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(v(r_ext - rc, ang_ini));
+        if rc_ext >= 1.0 && rc_int >= 1.0 {
+            let da_ext = rc_ext / r_ext;
+            let da_int = rc_int / r_int;
+            sink.BeginFigure(v(r_int + rc_int, ang_ini), D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(v(r_ext - rc_ext, ang_ini));
             sink.AddArc(&D2D1_ARC_SEGMENT {
                 point: v(r_ext, ang_ini + da_ext),
-                size: D2D_SIZE_F { width: rc, height: rc },
+                size: D2D_SIZE_F { width: rc_ext, height: rc_ext },
                 rotationAngle: 0.0,
                 sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
                 arcSize: D2D1_ARC_SIZE_SMALL,
@@ -241,16 +237,16 @@ fn dibujar_segmento(
                 arcSize: D2D1_ARC_SIZE_SMALL,
             });
             sink.AddArc(&D2D1_ARC_SEGMENT {
-                point: v(r_ext - rc, ang_fin),
-                size: D2D_SIZE_F { width: rc, height: rc },
+                point: v(r_ext - rc_ext, ang_fin),
+                size: D2D_SIZE_F { width: rc_ext, height: rc_ext },
                 rotationAngle: 0.0,
                 sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
                 arcSize: D2D1_ARC_SIZE_SMALL,
             });
-            sink.AddLine(v(r_int + rc, ang_fin));
+            sink.AddLine(v(r_int + rc_int, ang_fin));
             sink.AddArc(&D2D1_ARC_SEGMENT {
                 point: v(r_int, ang_fin - da_int),
-                size: D2D_SIZE_F { width: rc, height: rc },
+                size: D2D_SIZE_F { width: rc_int, height: rc_int },
                 rotationAngle: 0.0,
                 sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
                 arcSize: D2D1_ARC_SIZE_SMALL,
@@ -263,8 +259,8 @@ fn dibujar_segmento(
                 arcSize: D2D1_ARC_SIZE_SMALL,
             });
             sink.AddArc(&D2D1_ARC_SEGMENT {
-                point: v(r_int + rc, ang_ini),
-                size: D2D_SIZE_F { width: rc, height: rc },
+                point: v(r_int + rc_int, ang_ini),
+                size: D2D_SIZE_F { width: rc_int, height: rc_int },
                 rotationAngle: 0.0,
                 sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
                 arcSize: D2D1_ARC_SIZE_SMALL,
@@ -292,11 +288,7 @@ fn dibujar_segmento(
         }
         sink.Close()?;
     }
-
-    p.rellenar_geometria(&geo, relleno);
-    p.bordear_geometria(&geo, borde, 1.2 * escala);
-
-    Ok(())
+    Ok(geo)
 }
 
 /// Dibuja la rueda con cualquier pintor: la ventana de la rueda y la vista previa de los ajustes
@@ -314,17 +306,7 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     let n = e.baldosas.len();
     let r_int = wheel::radio_int(n) * s;
     let r_ext_base = wheel::radio_ext(n) * s;
-
-    let col_hover = if e.color_hover != [0, 0, 0] {
-        rgba(e.color_hover[0], e.color_hover[1], e.color_hover[2], 0.92)
-    } else {
-        SEGMENTO_HOVER
-    };
-    let col_fondo = if e.opacidad_fondo.is_finite() && e.opacidad_fondo > 0.0 {
-        rgba(26, 26, 32, e.opacidad_fondo)
-    } else {
-        SEGMENTO_FONDO
-    };
+    let op = if e.opacidad_fondo.is_finite() && e.opacidad_fondo > 0.0 { e.opacidad_fondo } else { 0.88 };
 
     let Ok(factory) = (unsafe { p.rt.GetFactory() }) else { return };
 
@@ -334,32 +316,68 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
         let (ang_ini, ang_fin) = wheel::angulos_sector(i, n);
         let ang_centro = (ang_ini + ang_fin) / 2.0;
 
-        let r_ext = if activa { r_ext_base + 5.0 * s } else { r_ext_base };
+        let r_ext = if activa { r_ext_base + 3.0 * s } else { r_ext_base };
+        let geo = match crear_segmento(&factory, cx, cy, ang_ini, ang_fin, r_int, r_ext, s) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        // 1. Sombra suave para separar del escritorio o resplandor violeta en hover:
+        if activa {
+            p.bordear_geometria(&geo, rgba(142, 107, 196, 0.22), 8.0 * s);
+            p.bordear_geometria(&geo, rgba(158, 122, 214, 0.38), 4.0 * s);
+        } else {
+            p.bordear_geometria(&geo, rgba(0, 0, 0, 0.20), 4.0 * s);
+            if let Ok(geo_sombra) = crear_segmento(&factory, cx, cy + 2.5 * s, ang_ini, ang_fin, r_int, r_ext, s) {
+                p.rellenar_geometria(&geo_sombra, rgba(0, 0, 0, 0.22));
+            }
+        }
+
+        // 2. Relleno con gradiente elegante (glassmorphism):
+        let p_int = Vector2 { X: cx + r_int * ang_centro.cos(), Y: cy + r_int * ang_centro.sin() };
+        let p_ext = Vector2 { X: cx + r_ext * ang_centro.cos(), Y: cy + r_ext * ang_centro.sin() };
+
+        if activa {
+            let col_int = if e.color_hover != [0, 0, 0] {
+                rgba(e.color_hover[0].saturating_sub(20), e.color_hover[1].saturating_sub(20), e.color_hover[2].saturating_sub(20), 0.94)
+            } else {
+                rgba(92, 60, 145, 0.95)
+            };
+            let col_ext = if e.color_hover != [0, 0, 0] {
+                rgba(e.color_hover[0], e.color_hover[1], e.color_hover[2], 0.98)
+            } else {
+                rgba(156, 118, 212, 0.98)
+            };
+            p.rellenar_geometria_gradiente(&geo, p_int, col_int, p_ext, col_ext);
+            p.bordear_geometria(&geo, rgba(225, 202, 255, 0.85), 1.5 * s);
+        } else {
+            let col_int = rgba(22, 26, 36, 0.85 * op);
+            let col_ext = rgba(38, 46, 62, 0.92 * op);
+            p.rellenar_geometria_gradiente(&geo, p_int, col_int, p_ext, col_ext);
+            p.bordear_geometria(&geo, rgba(255, 255, 255, 0.16), 1.1 * s);
+        }
+
+        // 3. Icono y texto:
         let b = &e.baldosas[i];
-
-        let relleno = if activa { col_hover } else { col_fondo };
-        let borde = if activa { SEGMENTO_BORDE_HOVER } else { SEGMENTO_BORDE };
-        let _ = dibujar_segmento(&factory, p, cx, cy, ang_ini, ang_fin, r_int, r_ext, relleno, borde, s);
-
         let r_medio = (r_int + r_ext) / 2.0;
         let (px, py) = (cx + r_medio * ang_centro.cos(), cy + r_medio * ang_centro.sin());
         let (ix, iy, lado) = if e.mostrar_nombres {
-            let (ix, iy) = (px, py - 8.0 * s);
-            let (tx, ty) = (px, py + 10.0 * s);
-            let w_txt = ((r_ext - r_int) * 0.95).min(76.0 * s);
+            let (ix, iy) = (px, py - 9.0 * s);
+            let (tx, ty) = (px, py + 12.0 * s);
+            let w_txt = ((r_ext - r_int) * 0.92).min(76.0 * s);
             let h_txt = 14.0 * s;
             let caja_txt = rect(tx - w_txt / 2.0, ty - h_txt / 2.0, w_txt, h_txt);
             p.texto(&b.nombre, caja_txt, 10.0 * s, Peso::Medio, Alin::Centro, tema::TEXTO);
-            (ix, iy, (r_ext - r_int) * 0.38 * if activa { 1.08 } else { 1.0 })
+            (ix, iy, 28.0 * s)
         } else {
-            (px, py, (r_ext - r_int) * 0.48 * if activa { 1.08 } else { 1.0 })
+            (px, py, 34.0 * s * if activa { 1.06 } else { 1.0 })
         };
 
         match (&b.visual, &b.grupo) {
             (Some(v), _) => pintar_visual(p, v, ix, iy, lado),
             (None, Some(sub)) if !sub.is_empty() => {
-                let celda = lado * 0.30;
-                let paso = celda + lado * 0.06;
+                let celda = lado * 0.32;
+                let paso = celda + lado * 0.08;
                 let filas = sub.len().min(4).div_ceil(2) as f32;
                 for (k, v) in sub.iter().enumerate().take(4) {
                     let (fx, fy) = ((k % 2) as f32, (k / 2) as f32);
@@ -372,7 +390,7 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
                 }
             }
             (None, Some(_)) => {
-                let li = lado * 0.46;
+                let li = lado * 0.52;
                 if let Some(n) = crate::lucide::nombre("folder") {
                     p.lucide(n, rect(ix - li / 2.0, iy - li / 2.0, li, li), tema::TEXTO);
                 }
@@ -380,7 +398,7 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
             (None, None) => {
                 let inicial: String = b.nombre.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
                 let r_ini = rect(ix - lado / 2.0, iy - lado / 2.0, lado, lado);
-                p.texto(&inicial, r_ini, 16.0 * s, Peso::Semi, Alin::Centro, tema::TEXTO);
+                p.texto(&inicial, r_ini, 18.0 * s, Peso::Semi, Alin::Centro, tema::TEXTO);
             }
         }
 
@@ -390,13 +408,22 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     }
 
     // Botón central: soltar aquí cancela.
-    let rc = e.radio_central.clamp(18.0 * s, 26.0 * s);
+    let rc = e.radio_central.clamp(19.0 * s, 23.0 * s);
     let en_centro = e.seleccion.is_none();
-    p.circulo(cx, cy + 1.5 * s, rc + 1.0 * s, rgba(0, 0, 0, 0.25));
-    p.circulo(cx, cy, rc, CENTRO_FONDO);
-    p.borde_circulo(cx, cy, rc - 0.5, if en_centro { tema::BORDE_FUERTE } else { tema::BORDE }, 1.0);
-    let g_centro = if e.grupo.is_some() { glifo::ATRAS } else { glifo::CERRAR };
-    p.glifo(g_centro, cx, cy, 12.0 * s, if en_centro { tema::TEXTO } else { tema::TEXTO_2 });
+    p.circulo(cx, cy + 2.0 * s, rc + 1.0 * s, rgba(0, 0, 0, 0.35));
+    p.circulo(cx, cy, rc, rgba(16, 18, 24, 0.95));
+    p.borde_circulo(cx, cy, rc, if en_centro { rgba(255, 255, 255, 0.35) } else { rgba(255, 255, 255, 0.12) }, 1.0 * s);
+    if e.grupo.is_some() {
+        let d = 5.0 * s;
+        let col = if en_centro { tema::TEXTO } else { tema::TEXTO_2 };
+        p.linea(cx + d * 0.6, cy - d, cx - d * 0.6, cy, col, 1.6 * s);
+        p.linea(cx - d * 0.6, cy, cx + d * 0.6, cy + d, col, 1.6 * s);
+    } else {
+        let d = 4.8 * s;
+        let col = if en_centro { rgba(255, 255, 255, 1.0) } else { rgba(255, 255, 255, 0.85) };
+        p.linea(cx - d, cy - d, cx + d, cy + d, col, 1.6 * s);
+        p.linea(cx + d, cy - d, cx - d, cy + d, col, 1.6 * s);
+    }
 
     // Dentro de un grupo, su nombre bajo el botón central.
     if let Some(nombre) = e.grupo {
@@ -412,10 +439,10 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     // Etiqueta con el nombre, hacia fuera de la rueda.
     if let (Some((a, r_borde)), Some(i)) = (etiqueta, e.seleccion) {
         let nombre = &e.baldosas[i].nombre;
-        let tam = 12.5 * s;
-        let (alto_e, pad) = (26.0 * s, 11.0 * s);
+        let tam = 12.0 * s;
+        let (alto_e, pad) = (26.0 * s, 12.0 * s);
         let ancho_e = (p.medir(nombre, tam, Peso::Semi) + 2.0 * pad).min(260.0 * s);
-        let sep = 14.0 * s;
+        let sep = 16.0 * s;
         let cos = a.cos();
         let sin = a.sin();
         let (ox, oy) = (cx + (r_borde + sep) * cos, cy + (r_borde + sep) * sin);
@@ -429,9 +456,10 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
             (ox - ancho_e / 2.0, oy)
         };
         let caja = rect(x, y, ancho_e, alto_e);
-        p.sombra(caja, alto_e / 2.0, 0.8);
-        p.rellenar(caja, alto_e / 2.0, tema::CLARO);
-        p.texto(nombre, rect(x + pad, y, ancho_e - 2.0 * pad, alto_e), tam, Peso::Semi, Alin::Centro, tema::TEXTO_OSCURO);
+        p.sombra(caja, alto_e / 2.0, 0.9);
+        p.rellenar(caja, alto_e / 2.0, rgba(28, 32, 44, 0.95));
+        p.bordear(caja, alto_e / 2.0, rgba(255, 255, 255, 0.20), 1.0);
+        p.texto(nombre, rect(x + pad, y, ancho_e - 2.0 * pad, alto_e), tam, Peso::Semi, Alin::Centro, tema::TEXTO);
     }
 
     if n == 0 {
@@ -446,11 +474,11 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
 fn pintar_visual(p: &mut Pintor, v: &Visual, cx: f32, cy: f32, lado: f32) {
     match v {
         Visual::Imagen(icono) => {
-            let li = lado * 0.58;
+            let li = lado * 0.70;
             p.imagen(icono, rect(cx - li / 2.0, cy - li / 2.0, li, li), 1.0);
         }
         Visual::Lucide(nombre) => {
-            let li = lado * 0.46;
+            let li = lado * 0.62;
             p.lucide(nombre, rect(cx - li / 2.0, cy - li / 2.0, li, li), tema::TEXTO);
         }
     }

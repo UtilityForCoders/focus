@@ -8,21 +8,26 @@ pub const BALDOSA: f32 = 54.0;
 /// Radio mínimo del círculo en el que se reparten las baldosas.
 pub const RADIO_MIN: f32 = 112.0;
 
-pub const RADIO_INTERIOR: f32 = 38.0;   // radio del hueco central
-pub const RADIO_EXTERIOR: f32 = 108.0;  // radio exterior del segmento
-pub const GAP_ANGULO: f32 = 0.055;      // separación angular en radianes entre segmentos
-pub const REDONDEO_ESQUINA: f32 = 8.0;  // px lógicos para esquinas redondeadas
+pub const RADIO_INTERIOR: f32 = 36.0;   // radio del hueco central
+pub const RADIO_EXTERIOR: f32 = 124.0;  // radio exterior del segmento
+pub const GAP_ANGULO: f32 = 0.040;      // separación angular fina y elegante
+pub const REDONDEO_ESQUINA: f32 = 11.0; // px lógicos para esquinas redondeadas
 
 /// Calcula el radio del anillo exterior escalado según cantidad de accesos.
 /// Para n pequeño se mantiene en RADIO_EXTERIOR; para n grande puede crecer un poco.
 pub fn radio_ext(n: usize) -> f32 {
     // Para n <= 4 el pétalo es más grande para no verse vacío
-    if n <= 4 { RADIO_EXTERIOR * 1.15 } else { RADIO_EXTERIOR }
+    if n <= 3 {
+        RADIO_EXTERIOR * 1.10
+    } else if n == 4 {
+        RADIO_EXTERIOR * 1.05
+    } else {
+        RADIO_EXTERIOR
+    }
 }
 
 pub fn radio_int(_n: usize) -> f32 {
-    // El hueco central se ajusta para que el centro no quede demasiado grande
-    RADIO_INTERIOR.max(10.0)
+    RADIO_INTERIOR
 }
 
 /// Ángulo inicial y final del sector i de n (en radianes).
@@ -49,7 +54,7 @@ pub fn radio_anillo(n: usize) -> f32 {
 
 /// Distancia del centro al borde exterior de la rueda (para que no se salga del monitor).
 pub fn alcance(n: usize) -> f32 {
-    radio_anillo(n) + BALDOSA * 0.7 + 40.0
+    radio_ext(n).max(radio_anillo(n)) + 60.0
 }
 
 /// Ángulo (radianes) del acceso `i` de `n`. El 0 apunta hacia arriba y el resto sigue en el
