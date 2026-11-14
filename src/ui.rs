@@ -126,9 +126,17 @@ impl Pintor {
         })
     }
 
-    fn color(&self, c: &Color) -> &ID2D1SolidColorBrush {
+    pub fn color(&self, c: &Color) -> &ID2D1SolidColorBrush {
         unsafe { self.pincel.SetColor(c) };
         &self.pincel
+    }
+
+    pub fn rellenar_geometria(&self, geo: &ID2D1Geometry, c: Color) {
+        unsafe { self.rt.FillGeometry(geo, self.color(&c), None) };
+    }
+
+    pub fn bordear_geometria(&self, geo: &ID2D1Geometry, c: Color, grosor: f32) {
+        unsafe { self.rt.DrawGeometry(geo, self.color(&c), grosor, None) };
     }
 
     pub fn rellenar(&self, r: Rect, radio: f32, c: Color) {
