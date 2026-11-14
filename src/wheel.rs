@@ -8,6 +8,39 @@ pub const BALDOSA: f32 = 54.0;
 /// Radio mínimo del círculo en el que se reparten las baldosas.
 pub const RADIO_MIN: f32 = 112.0;
 
+pub const RADIO_INTERIOR: f32 = 38.0;   // radio del hueco central
+pub const RADIO_EXTERIOR: f32 = 108.0;  // radio exterior del segmento
+pub const GAP_ANGULO: f32 = 0.055;      // separación angular en radianes entre segmentos
+pub const REDONDEO_ESQUINA: f32 = 8.0;  // px lógicos para esquinas redondeadas
+
+/// Calcula el radio del anillo exterior escalado según cantidad de accesos.
+/// Para n pequeño se mantiene en RADIO_EXTERIOR; para n grande puede crecer un poco.
+pub fn radio_ext(n: usize) -> f32 {
+    // Para n <= 4 el pétalo es más grande para no verse vacío
+    if n <= 4 { RADIO_EXTERIOR * 1.15 } else { RADIO_EXTERIOR }
+}
+
+pub fn radio_int(_n: usize) -> f32 {
+    // El hueco central se ajusta para que el centro no quede demasiado grande
+    RADIO_INTERIOR.max(10.0)
+}
+
+/// Ángulo inicial y final del sector i de n (en radianes).
+/// El gap se reparte mitad en cada lado del sector.
+/// El sector 0 está centrado en -PI/2 (arriba).
+pub fn angulos_sector(i: usize, n: usize) -> (f32, f32) {
+    let paso = TAU / n as f32;
+    let centro = -PI / 2.0 + paso * i as f32;
+    let mitad = paso / 2.0 - GAP_ANGULO / 2.0;
+    (centro - mitad, centro + mitad)
+}
+
+/// Punto en un arco circular de radio `r` centrado en el origen, en ángulo `a`.
+#[allow(dead_code)]
+pub fn punto_arco(r: f32, a: f32) -> (f32, f32) {
+    (r * a.cos(), r * a.sin())
+}
+
 /// Radio del círculo de baldosas: crece con la cantidad de accesos para que no se pisen.
 pub fn radio_anillo(n: usize) -> f32 {
     // Cada baldosa ocupa su lado más un 35 % de aire a lo largo de la circunferencia.
@@ -21,6 +54,7 @@ pub fn alcance(n: usize) -> f32 {
 
 /// Ángulo (radianes) del acceso `i` de `n`. El 0 apunta hacia arriba y el resto sigue en el
 /// sentido de las agujas del reloj, como en la pantalla (y hacia abajo).
+#[allow(dead_code)]
 pub fn angulo_centro(i: usize, n: usize) -> f32 {
     -PI / 2.0 + TAU * i as f32 / n as f32
 }
@@ -78,5 +112,16 @@ mod tests {
         assert!(radio_anillo(20) > RADIO_MIN);
         // Con 20 accesos, el arco entre centros deja al menos el lado de una baldosa.
         assert!(TAU * radio_anillo(20) / 20.0 >= BALDOSA);
+    }
+
+    #[test]
+    fn angulos_sector_y_punto_arco() {
+        let (ini, fin) = angulos_sector(0, 4);
+        assert!(ini < fin);
+        let (x, y) = punto_arco(100.0, 0.0);
+        assert!((x - 100.0).abs() < 1e-4);
+        assert!(y.abs() < 1e-4);
+        assert!(radio_ext(4) > radio_ext(6));
+        assert_eq!(radio_int(4), RADIO_INTERIOR);
     }
 }
