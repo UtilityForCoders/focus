@@ -1,12 +1,12 @@
 [package]
-name = "focus"
+name = "orbyt"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Lanzador radial para Windows: mantén el botón central, apunta y suelta."
 
 [[bin]]
-name = "focus"
+name = "orbyt"
 path = "src/main.rs"
 
 [dependencies]

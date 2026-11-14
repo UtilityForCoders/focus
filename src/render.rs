@@ -2,17 +2,16 @@
 //! "layered" con `UpdateLayeredWindow`. Así la transparencia es por píxel (las sombras, el
 //! oscurecido del fondo) sin depender del compositor para nada más.
 //!
-//! Diseño: baldosas redondeadas con el ícono de cada acceso, repartidas en círculo alrededor de
-//! un botón central (soltar ahí cancela). La baldosa a la que apuntas crece un poco, se aclara y
-//! muestra su nombre en una etiqueta hacia fuera de la rueda.
+//! Diseño: pétalos radiales con esquinas redondeadas alrededor de un botón central (soltar ahí cancela).
+//! El pétalo al que apuntas se resalta en hover, y muestra su nombre en una etiqueta hacia fuera de la rueda.
 //!
 //! Todo se mide en píxeles físicos: la escala (DPI del monitor por el tamaño elegido) llega en
 //! `Escena::escala` y se aplica a las medidas, no al render target (que trabaja a 96 ppp).
 
 use crate::config::{Config, Grupo};
 use crate::icons::{self, Visual};
-use crate::ui::{self, glifo, rect, rgba, tema, Alin, Peso, Pintor, Rect};
-use crate::wheel::{self, BALDOSA};
+use crate::ui::{self, rect, rgba, tema, Alin, Peso, Pintor};
+use crate::wheel;
 use windows::core::{Interface, Result};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -20,7 +19,7 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
-use windows_numerics::Matrix3x2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 /// Una baldosa de la rueda: un acceso o un grupo.
 #[derive(Clone)]
@@ -70,6 +69,9 @@ pub struct Escena<'a> {
     pub oscurecer: bool,
     /// Radio de la zona central (cancelar), en píxeles físicos.
     pub radio_central: f32,
+    pub mostrar_nombres: bool,
+    pub color_hover: [u8; 3],
+    pub opacidad_fondo: f32,
 }
 
 pub struct Renderer {
@@ -84,10 +86,6 @@ pub struct Renderer {
     pub alto: i32,
 }
 
-const BALDOSA_FONDO: ui::Color = rgba(26, 26, 30, 0.88);
-const BALDOSA_FONDO_ACTIVA: ui::Color = rgba(64, 64, 74, 0.96);
-const BALDOSA_BORDE: ui::Color = rgba(255, 255, 255, 0.12);
-const BALDOSA_BORDE_ACTIVA: ui::Color = rgba(255, 255, 255, 0.40);
 const CENTRO_FONDO: ui::Color = rgba(20, 20, 24, 0.90);
 
 impl Renderer {
@@ -195,6 +193,104 @@ impl Renderer {
     }
 }
 
+/// Crea la geometría vectorial de un segmento de pétalo curvado con esquinas redondeadas.
+fn crear_segmento(
+    factory: &ID2D1Factory,
+    cx: f32,
+    cy: f32,
+    ang_ini: f32,
+    ang_fin: f32,
+    r_int: f32,
+    r_ext: f32,
+    escala: f32,
+) -> Result<ID2D1PathGeometry> {
+    let geo = unsafe { factory.CreatePathGeometry()? };
+    let sink = unsafe { geo.Open()? };
+    let v = |r: f32, a: f32| Vector2 { X: cx + r * a.cos(), Y: cy + r * a.sin() };
+
+    let span = (ang_fin - ang_ini).abs();
+    let rc_ext = (wheel::REDONDEO_ESQUINA * escala)
+        .min((r_ext - r_int) * 0.35)
+        .min(r_ext * span * 0.35);
+    let rc_int = (7.0 * escala)
+        .min((r_ext - r_int) * 0.25)
+        .min(r_int * span * 0.30);
+
+    unsafe {
+        if rc_ext >= 1.0 && rc_int >= 1.0 {
+            let da_ext = rc_ext / r_ext;
+            let da_int = rc_int / r_int;
+            sink.BeginFigure(v(r_int + rc_int, ang_ini), D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(v(r_ext - rc_ext, ang_ini));
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_ext, ang_ini + da_ext),
+                size: D2D_SIZE_F { width: rc_ext, height: rc_ext },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_ext, ang_fin - da_ext),
+                size: D2D_SIZE_F { width: r_ext, height: r_ext },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_ext - rc_ext, ang_fin),
+                size: D2D_SIZE_F { width: rc_ext, height: rc_ext },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddLine(v(r_int + rc_int, ang_fin));
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_int, ang_fin - da_int),
+                size: D2D_SIZE_F { width: rc_int, height: rc_int },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_int, ang_ini + da_int),
+                size: D2D_SIZE_F { width: r_int, height: r_int },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_int + rc_int, ang_ini),
+                size: D2D_SIZE_F { width: rc_int, height: rc_int },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        } else {
+            sink.BeginFigure(v(r_int, ang_ini), D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(v(r_ext, ang_ini));
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_ext, ang_fin),
+                size: D2D_SIZE_F { width: r_ext, height: r_ext },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddLine(v(r_int, ang_fin));
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(r_int, ang_ini),
+                size: D2D_SIZE_F { width: r_int, height: r_int },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        }
+        sink.Close()?;
+    }
+    Ok(geo)
+}
+
 /// Dibuja la rueda con cualquier pintor: la ventana de la rueda y la vista previa de los ajustes
 /// usan esta misma función. No toca el fondo; deja la transformación como la encontró.
 pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
@@ -208,17 +304,119 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     unsafe { p.rt.SetTransform(&(m * previa)) };
 
     let n = e.baldosas.len();
-    // Las baldosas salen desde el centro hacia su sitio.
-    let radio = wheel::radio_anillo(n) * s * (0.55 + 0.45 * e.progreso);
+    let r_int = wheel::radio_int(n) * s;
+    let r_ext_base = wheel::radio_ext(n) * s;
+    let op = if e.opacidad_fondo.is_finite() && e.opacidad_fondo > 0.0 { e.opacidad_fondo } else { 0.88 };
+
+    let Ok(factory) = (unsafe { p.rt.GetFactory() }) else { return };
+
+    let mut etiqueta: Option<(f32, f32)> = None;
+    for i in 0..n {
+        let activa = e.seleccion == Some(i);
+        let (ang_ini, ang_fin) = wheel::angulos_sector(i, n);
+        let ang_centro = (ang_ini + ang_fin) / 2.0;
+
+        let r_ext = if activa { r_ext_base + 3.0 * s } else { r_ext_base };
+        let geo = match crear_segmento(&factory, cx, cy, ang_ini, ang_fin, r_int, r_ext, s) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        // 1. Sombra suave para separar del escritorio o resplandor violeta en hover:
+        if activa {
+            p.bordear_geometria(&geo, rgba(142, 107, 196, 0.22), 8.0 * s);
+            p.bordear_geometria(&geo, rgba(158, 122, 214, 0.38), 4.0 * s);
+        } else {
+            p.bordear_geometria(&geo, rgba(0, 0, 0, 0.20), 4.0 * s);
+            if let Ok(geo_sombra) = crear_segmento(&factory, cx, cy + 2.5 * s, ang_ini, ang_fin, r_int, r_ext, s) {
+                p.rellenar_geometria(&geo_sombra, rgba(0, 0, 0, 0.22));
+            }
+        }
+
+        // 2. Relleno con gradiente elegante (glassmorphism):
+        let p_int = Vector2 { X: cx + r_int * ang_centro.cos(), Y: cy + r_int * ang_centro.sin() };
+        let p_ext = Vector2 { X: cx + r_ext * ang_centro.cos(), Y: cy + r_ext * ang_centro.sin() };
+
+        if activa {
+            let col_int = if e.color_hover != [0, 0, 0] {
+                rgba(e.color_hover[0].saturating_sub(20), e.color_hover[1].saturating_sub(20), e.color_hover[2].saturating_sub(20), 0.94)
+            } else {
+                rgba(92, 60, 145, 0.95)
+            };
+            let col_ext = if e.color_hover != [0, 0, 0] {
+                rgba(e.color_hover[0], e.color_hover[1], e.color_hover[2], 0.98)
+            } else {
+                rgba(156, 118, 212, 0.98)
+            };
+            p.rellenar_geometria_gradiente(&geo, p_int, col_int, p_ext, col_ext);
+            p.bordear_geometria(&geo, rgba(225, 202, 255, 0.85), 1.5 * s);
+        } else {
+            let col_int = rgba(22, 26, 36, 0.85 * op);
+            let col_ext = rgba(38, 46, 62, 0.92 * op);
+            p.rellenar_geometria_gradiente(&geo, p_int, col_int, p_ext, col_ext);
+            p.bordear_geometria(&geo, rgba(255, 255, 255, 0.16), 1.1 * s);
+        }
+
+        // 3. Icono y texto:
+        let b = &e.baldosas[i];
+        let r_medio = (r_int + r_ext) / 2.0;
+        let (px, py) = (cx + r_medio * ang_centro.cos(), cy + r_medio * ang_centro.sin());
+        // Los nombres dentro de cada pétalo se solapaban y desplazaban los íconos. El ícono
+        // permanece centrado y el nombre seleccionado se dibuja en una sola etiqueta exterior.
+        let (ix, iy, lado) = (px, py, 34.0 * s * if activa { 1.06 } else { 1.0 });
+
+        match (&b.visual, &b.grupo) {
+            (Some(v), _) => pintar_visual(p, v, ix, iy, lado),
+            (None, Some(sub)) if !sub.is_empty() => {
+                let celda = lado * 0.32;
+                let paso = celda + lado * 0.08;
+                let filas = sub.len().min(4).div_ceil(2) as f32;
+                for (k, v) in sub.iter().enumerate().take(4) {
+                    let (fx, fy) = ((k % 2) as f32, (k / 2) as f32);
+                    let mx = ix + (fx - 0.5) * paso;
+                    let my = iy + (fy - (filas - 1.0) / 2.0) * paso;
+                    match v {
+                        Some(v) => pintar_visual(p, v, mx, my, celda / 0.58),
+                        None => p.rellenar(rect(mx - celda / 2.0, my - celda / 2.0, celda, celda), celda * 0.25, tema::CONTROL_ACTIVO),
+                    }
+                }
+            }
+            (None, Some(_)) => {
+                let li = lado * 0.52;
+                if let Some(n) = crate::lucide::nombre("folder") {
+                    p.lucide(n, rect(ix - li / 2.0, iy - li / 2.0, li, li), tema::TEXTO);
+                }
+            }
+            (None, None) => {
+                let inicial: String = b.nombre.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+                let r_ini = rect(ix - lado / 2.0, iy - lado / 2.0, lado, lado);
+                p.texto(&inicial, r_ini, 18.0 * s, Peso::Semi, Alin::Centro, tema::TEXTO);
+            }
+        }
+
+        if activa && e.mostrar_nombres {
+            etiqueta = Some((ang_centro, r_ext));
+        }
+    }
 
     // Botón central: soltar aquí cancela.
-    let rc = e.radio_central.clamp(18.0 * s, 26.0 * s);
+    let rc = e.radio_central.clamp(19.0 * s, 23.0 * s);
     let en_centro = e.seleccion.is_none();
-    p.circulo(cx, cy + 1.5 * s, rc + 1.0 * s, rgba(0, 0, 0, 0.25));
-    p.circulo(cx, cy, rc, CENTRO_FONDO);
-    p.borde_circulo(cx, cy, rc - 0.5, if en_centro { tema::BORDE_FUERTE } else { tema::BORDE }, 1.0);
-    let g_centro = if e.grupo.is_some() { glifo::ATRAS } else { glifo::CERRAR };
-    p.glifo(g_centro, cx, cy, 12.0 * s, if en_centro { tema::TEXTO } else { tema::TEXTO_2 });
+    p.circulo(cx, cy + 2.0 * s, rc + 1.0 * s, rgba(0, 0, 0, 0.35));
+    p.circulo(cx, cy, rc, rgba(16, 18, 24, 0.95));
+    p.borde_circulo(cx, cy, rc, if en_centro { rgba(255, 255, 255, 0.35) } else { rgba(255, 255, 255, 0.12) }, 1.0 * s);
+    if e.grupo.is_some() {
+        let d = 5.0 * s;
+        let col = if en_centro { tema::TEXTO } else { tema::TEXTO_2 };
+        p.linea(cx + d * 0.6, cy - d, cx - d * 0.6, cy, col, 1.6 * s);
+        p.linea(cx - d * 0.6, cy, cx + d * 0.6, cy + d, col, 1.6 * s);
+    } else {
+        let d = 4.8 * s;
+        let col = if en_centro { rgba(255, 255, 255, 1.0) } else { rgba(255, 255, 255, 0.85) };
+        p.linea(cx - d, cy - d, cx + d, cy + d, col, 1.6 * s);
+        p.linea(cx + d, cy - d, cx - d, cy + d, col, 1.6 * s);
+    }
+
     // Dentro de un grupo, su nombre bajo el botón central.
     if let Some(nombre) = e.grupo {
         let tam = 11.0 * s;
@@ -230,83 +428,36 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
         p.texto(nombre, rect(caja.left + pad, caja.top, ancho_e - 2.0 * pad, alto_e), tam, Peso::Semi, Alin::Centro, tema::TEXTO);
     }
 
-    let mut etiqueta: Option<(Rect, f32, f32)> = None;
-    for i in 0..n {
-        let activa = e.seleccion == Some(i);
-        let a = wheel::angulo_centro(i, n);
-        let (bx, by) = (cx + radio * a.cos(), cy + radio * a.sin());
-        let lado = BALDOSA * s * if activa { 1.14 } else { 1.0 };
-        let r = rect(bx - lado / 2.0, by - lado / 2.0, lado, lado);
-        let esquina = lado * 0.27;
-
-        let b = &e.baldosas[i];
-
-        // Un grupo se ve como una pila: otra baldosa asoma detrás, hacia fuera de la rueda.
-        if b.es_grupo() {
-            let (ox, oy) = (a.cos() * 5.0 * s, a.sin() * 5.0 * s);
-            let detras = rect(r.left + ox, r.top + oy, lado, lado);
-            p.rellenar(detras, esquina, BALDOSA_FONDO);
-            p.bordear(detras, esquina, BALDOSA_BORDE, 1.0);
-        }
-        p.sombra(r, esquina, if activa { 1.6 } else { 1.0 });
-        p.rellenar(r, esquina, if activa { BALDOSA_FONDO_ACTIVA } else { BALDOSA_FONDO });
-        p.bordear(r, esquina, if activa { BALDOSA_BORDE_ACTIVA } else { BALDOSA_BORDE }, 1.0);
-
-        match (&b.visual, &b.grupo) {
-            (Some(v), _) => pintar_visual(p, v, bx, by, lado),
-            (None, Some(sub)) if !sub.is_empty() => {
-                // Hasta cuatro miniaturas en una cuadrícula de 2 x 2.
-                let celda = lado * 0.30;
-                let paso = celda + lado * 0.06;
-                let filas = sub.len().min(4).div_ceil(2) as f32;
-                for (k, v) in sub.iter().enumerate().take(4) {
-                    let (fx, fy) = ((k % 2) as f32, (k / 2) as f32);
-                    let mx = bx + (fx - 0.5) * paso;
-                    let my = by + (fy - (filas - 1.0) / 2.0) * paso;
-                    match v {
-                        Some(v) => pintar_visual(p, v, mx, my, celda / 0.58),
-                        None => p.rellenar(rect(mx - celda / 2.0, my - celda / 2.0, celda, celda), celda * 0.25, tema::CONTROL_ACTIVO),
-                    }
-                }
-            }
-            (None, Some(_)) => {
-                let li = lado * 0.46;
-                if let Some(n) = crate::lucide::nombre("folder") {
-                    p.lucide(n, rect(bx - li / 2.0, by - li / 2.0, li, li), tema::TEXTO);
-                }
-            }
-            (None, None) => {
-                let inicial: String = b.nombre.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-                p.texto(&inicial, r, 20.0 * s, Peso::Semi, Alin::Centro, tema::TEXTO);
-            }
-        }
-        if activa {
-            etiqueta = Some((r, a.cos(), a.sin()));
-        }
-    }
-
-    // Etiqueta con el nombre, hacia fuera de la rueda: a un lado si la baldosa está a la
-    // izquierda o a la derecha, encima o debajo si está arriba o abajo.
-    if let (Some((r, cos, sin)), Some(i)) = (etiqueta, e.seleccion) {
+    // Etiqueta con el nombre, hacia fuera de la rueda.
+    if let (Some((a, r_borde)), Some(i)) = (etiqueta, e.seleccion) {
         let nombre = &e.baldosas[i].nombre;
-        let tam = 12.5 * s;
-        let (alto_e, pad) = (26.0 * s, 11.0 * s);
+        let tam = 12.0 * s;
+        let (alto_e, pad) = (26.0 * s, 12.0 * s);
         let ancho_e = (p.medir(nombre, tam, Peso::Semi) + 2.0 * pad).min(260.0 * s);
-        let sep = 10.0 * s;
-        let (mx, my) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        let sep = 16.0 * s;
+        let cos = a.cos();
+        let sin = a.sin();
+        let (ox, oy) = (cx + (r_borde + sep) * cos, cy + (r_borde + sep) * sin);
         let (x, y) = if cos > 0.35 {
-            (r.right + sep, my - alto_e / 2.0)
+            (ox, oy - alto_e / 2.0)
         } else if cos < -0.35 {
-            (r.left - sep - ancho_e, my - alto_e / 2.0)
+            (ox - ancho_e, oy - alto_e / 2.0)
         } else if sin < 0.0 {
-            (mx - ancho_e / 2.0, r.top - sep - alto_e)
+            (ox - ancho_e / 2.0, oy - alto_e)
         } else {
-            (mx - ancho_e / 2.0, r.bottom + sep)
+            (ox - ancho_e / 2.0, oy)
         };
+        // La rueda puede abrirse junto al borde del monitor. Mantener la etiqueta dentro del
+        // render target evita que los nombres laterales o largos queden recortados.
+        let tam_area = unsafe { p.rt.GetSize() };
+        let margen = 8.0 * s;
+        let x = x.clamp(margen, (tam_area.width - ancho_e - margen).max(margen));
+        let y = y.clamp(margen, (tam_area.height - alto_e - margen).max(margen));
         let caja = rect(x, y, ancho_e, alto_e);
-        p.sombra(caja, alto_e / 2.0, 0.8);
-        p.rellenar(caja, alto_e / 2.0, tema::CLARO);
-        p.texto(nombre, rect(x + pad, y, ancho_e - 2.0 * pad, alto_e), tam, Peso::Semi, Alin::Centro, tema::TEXTO_OSCURO);
+        p.sombra(caja, alto_e / 2.0, 0.9);
+        p.rellenar(caja, alto_e / 2.0, rgba(28, 32, 44, 0.95));
+        p.bordear(caja, alto_e / 2.0, rgba(255, 255, 255, 0.20), 1.0);
+        p.texto(nombre, rect(x + pad, y, ancho_e - 2.0 * pad, alto_e), tam, Peso::Semi, Alin::Centro, tema::TEXTO);
     }
 
     if n == 0 {
@@ -321,11 +472,11 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
 fn pintar_visual(p: &mut Pintor, v: &Visual, cx: f32, cy: f32, lado: f32) {
     match v {
         Visual::Imagen(icono) => {
-            let li = lado * 0.58;
+            let li = lado * 0.70;
             p.imagen(icono, rect(cx - li / 2.0, cy - li / 2.0, li, li), 1.0);
         }
         Visual::Lucide(nombre) => {
-            let li = lado * 0.46;
+            let li = lado * 0.62;
             p.lucide(nombre, rect(cx - li / 2.0, cy - li / 2.0, li, li), tema::TEXTO);
         }
     }

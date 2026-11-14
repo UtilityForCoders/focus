@@ -2,7 +2,7 @@
 
 Cada ícono de Lucide es una lista de formas SVG (path, circle, rect, line, polyline, polygon,
 ellipse) dibujadas con el mismo trazo. Aquí se aplanan a una sola cadena de datos de `path`, para
-que en Focus cada ícono sea una sola geometría de Direct2D y una sola llamada de dibujo.
+que en Orbyt cada ícono sea una sola geometría de Direct2D y una sola llamada de dibujo.
 
 Uso:
     npm pack lucide-static@<versión>  y extraer el .tgz

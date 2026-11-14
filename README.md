@@ -1,4 +1,4 @@
-# Focus
+# Orbyt
 
 Lanzador radial para Windows 10 y 11, escrito en Rust puro (Win32 + Direct2D).
 
@@ -13,9 +13,9 @@ se reenvía tal cual, así que abrir enlaces en otra pestaña sigue funcionando.
 cargo run --release
 ```
 
-Focus queda en el área de notificación. **Clic en su ícono** abre la configuración; el clic
+Orbyt queda en el área de notificación. **Clic en su ícono** abre la configuración; el clic
 derecho muestra un menú propio, oscuro como el resto de la app, con **Configuración** y
-**Salir de Focus**. Abrir `config.json` y su carpeta están en Configuración → **Acerca de**, donde
+**Salir de Orbyt**. Abrir `config.json` y su carpeta están en Configuración → **Acerca de**, donde
 también se puede salir.
 
 Para desarrollo:
@@ -36,13 +36,13 @@ Abre la ventana de configuración al arrancar.
 
 Una ventana oscura con fondo acrílico (Windows 11), dibujada con Direct2D, con estas secciones:
 
-- **General**: dónde aparece la rueda (bajo el puntero o en el centro), el retardo y si Focus
+- **General**: dónde aparece la rueda (bajo el puntero o en el centro), el retardo y si Orbyt
   se inicia con Windows.
 - **Activación**: qué botón abre la rueda (central, lateral atrás o lateral adelante), si se
   elige soltando el botón o con clic, y el tamaño de la zona central.
 - **Apariencia**: tamaño de la rueda y oscurecer el fondo, con una vista previa en vivo.
 - **Accesos**: los grupos y sus apps (ver abajo).
-- **Acerca de**: versión, abrir `config.json` o su carpeta, y salir de Focus.
+- **Acerca de**: versión, abrir `config.json` o su carpeta, y salir de Orbyt.
 
 ### Accesos
 
@@ -75,13 +75,13 @@ En **Activación → Elegir con** hay dos modos:
 | | Soltar el botón | Clic |
 |---|---|---|
 | Abrir la rueda | Mantén el botón | Mantén el botón y suéltalo: la rueda queda abierta |
-| Abrir un grupo | Apúntalo un instante, o pasa de largo la baldosa | Clic izquierdo sobre él |
+| Abrir un grupo | Mantén la dirección estable durante 650 ms | Clic izquierdo sobre él |
 | Abrir una app | Apúntala y suelta | Clic izquierdo sobre ella |
 | Volver | Quédate un instante en el centro (muestra una flecha) | Clic derecho, o clic en el centro |
 | Cerrar | Suelta en el centro o pulsa **Escape** | Clic derecho o en el centro (en la rueda principal), **Escape** o el botón otra vez |
 
-Como en todo Focus, cuenta la dirección del puntero, no hace falta acertar encima de la baldosa.
-En modo clic, los clics con la rueda abierta son para Focus y no llegan a la ventana de debajo.
+Como en todo Orbyt, cuenta la dirección del puntero, no hace falta acertar encima de la baldosa.
+En modo clic, los clics con la rueda abierta son para Orbyt y no llegan a la ventana de debajo.
 
 ### Íconos
 
@@ -92,7 +92,7 @@ Cada acceso usa su ícono automático, salvo que elijas otro con **Elegir…** e
   recortado sobre fondo blanco).
 - **Webs**: el favicon del sitio. Se descarga una vez en segundo plano (solo se envía el nombre
   del host al servicio de favicons de Google, o al de DuckDuckGo si falla) y se guarda en
-  `%APPDATA%\Focus\favicons`. Mientras no llega, se usa el ícono del navegador.
+  `%APPDATA%\Orbyt\favicons`. Mientras no llega, se usa el ícono del navegador.
 - **Lucide**: 1.891 íconos de línea, con buscador (las palabras clave están en inglés).
 - **Archivo**: cualquier ícono de un `.dll`, `.exe` o `.ico`; por defecto se abre
   `shell32.dll`, con más de 300.
@@ -103,7 +103,7 @@ JSON).
 
 ## config.json
 
-`%APPDATA%\Focus\config.json`. Es lo que escribe la ventana de configuración, pero también se
+`%APPDATA%\Orbyt\config.json`. Es lo que escribe la ventana de configuración, pero también se
 puede editar a mano: se crea con ejemplos la primera vez y se relee en cada pulsación.
 
 ```json

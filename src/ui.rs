@@ -58,7 +58,6 @@ pub mod glifo {
     pub const CERRAR: char = '\u{E711}';
     pub const CARPETA: char = '\u{E838}';
     pub const RECARGAR: char = '\u{E72C}';
-    pub const ATRAS: char = '\u{E72B}';
     pub const IZQUIERDA: char = '\u{E76B}';
     pub const DERECHA: char = '\u{E76C}';
     pub const APAGAR: char = '\u{E7E8}';
@@ -126,9 +125,42 @@ impl Pintor {
         })
     }
 
-    fn color(&self, c: &Color) -> &ID2D1SolidColorBrush {
+    pub fn color(&self, c: &Color) -> &ID2D1SolidColorBrush {
         unsafe { self.pincel.SetColor(c) };
         &self.pincel
+    }
+
+    pub fn rellenar_geometria(&self, geo: &ID2D1Geometry, c: Color) {
+        unsafe { self.rt.FillGeometry(geo, self.color(&c), None) };
+    }
+
+    pub fn rellenar_geometria_gradiente(
+        &self,
+        geo: &ID2D1Geometry,
+        p0: Vector2,
+        c0: Color,
+        p1: Vector2,
+        c1: Color,
+    ) {
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: c0 },
+            D2D1_GRADIENT_STOP { position: 1.0, color: c1 },
+        ];
+        unsafe {
+            if let Ok(col) = self.rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: p0,
+                    endPoint: p1,
+                };
+                if let Ok(brush) = self.rt.CreateLinearGradientBrush(&props, None, &col) {
+                    self.rt.FillGeometry(geo, &brush, None);
+                }
+            }
+        }
+    }
+
+    pub fn bordear_geometria(&self, geo: &ID2D1Geometry, c: Color, grosor: f32) {
+        unsafe { self.rt.DrawGeometry(geo, self.color(&c), grosor, None) };
     }
 
     pub fn rellenar(&self, r: Rect, radio: f32, c: Color) {

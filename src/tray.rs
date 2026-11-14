@@ -5,7 +5,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub const WM_FOCUS_TRAY: u32 = WM_APP + 10;
+pub const WM_ORBYT_TRAY: u32 = WM_APP + 10;
 
 fn datos(hwnd: HWND) -> NOTIFYICONDATAW {
     let mut nid = NOTIFYICONDATAW {
@@ -14,7 +14,7 @@ fn datos(hwnd: HWND) -> NOTIFYICONDATAW {
         uID: 1,
         ..Default::default()
     };
-    let tip: Vec<u16> = "Focus: mantén el botón central · clic para configurar".encode_utf16().collect();
+    let tip: Vec<u16> = "Orbyt: mantén el botón central · clic para configurar".encode_utf16().collect();
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     nid
 }
@@ -23,7 +23,7 @@ pub fn agregar(hwnd: HWND) {
     unsafe {
         let mut nid = datos(hwnd);
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        nid.uCallbackMessage = WM_FOCUS_TRAY;
+        nid.uCallbackMessage = WM_ORBYT_TRAY;
         nid.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
     }
