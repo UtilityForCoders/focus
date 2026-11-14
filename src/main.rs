@@ -24,6 +24,7 @@ mod lucide;
 mod lucide_datos;
 mod menu;
 mod render;
+mod ritmo;
 mod settings;
 mod tray;
 mod ui;
@@ -47,7 +48,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const TIMER_MANTENER: usize = 1;
-const TIMER_FOTOGRAMA: usize = 2;
 const TIMER_DEMO: usize = 3;
 /// Duración de la animación de apertura.
 const APERTURA_MS: f32 = 140.0;
@@ -258,6 +258,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_FOCUS_CANCEL => {
             con_app(cerrar);
         }
+        ritmo::WM_FOCUS_FOTOGRAMA => {
+            ritmo::atendido();
+            con_app(actualizar);
+        }
         WM_FOCUS_CLIC => {
             let elegido = con_app(|app| clic(app, lparam.0 == 1)).flatten();
             if let Some(acceso) = elegido {
@@ -273,9 +277,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if ESTADO.compare_exchange(PENDIENTE, ABIERTA, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     con_app(abrir);
                 }
-            }
-            TIMER_FOTOGRAMA => {
-                con_app(actualizar);
             }
             TIMER_DEMO => unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_DEMO);
@@ -374,13 +375,13 @@ fn abrir(app: &mut App) {
         pintar(app);
         let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(app.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        SetTimer(Some(app.hwnd), TIMER_FOTOGRAMA, 15, None);
+        ritmo::empezar(app.hwnd);
     }
 }
 
 fn cerrar(app: &mut App) {
     unsafe {
-        let _ = KillTimer(Some(app.hwnd), TIMER_FOTOGRAMA);
+        ritmo::parar();
         let _ = ShowWindow(app.hwnd, SW_HIDE);
     }
     app.rueda = None;
