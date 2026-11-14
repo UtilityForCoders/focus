@@ -88,6 +88,12 @@ pub struct Config {
     /// Oscurecer un poco la pantalla mientras la rueda está abierta.
     #[serde(default = "si")]
     pub oscurecer: bool,
+    #[serde(default = "mostrar_nombres_defecto")]
+    pub mostrar_nombres: bool,
+    #[serde(default = "opacidad_fondo_defecto")]
+    pub opacidad_fondo: f32, // 0.1–1.0, afecta fondo de segmentos
+    #[serde(default = "color_hover_defecto")]
+    pub color_hover: [u8; 3], // RGB del color de resaltado (default: violeta grisáceo 72,64,96)
     /// Los grupos de la rueda principal.
     #[serde(default)]
     pub grupos: Vec<Grupo>,
@@ -125,12 +131,30 @@ fn si() -> bool {
     true
 }
 
+fn mostrar_nombres_defecto() -> bool {
+    true
+}
+
+fn opacidad_fondo_defecto() -> f32 {
+    0.88
+}
+
+fn color_hover_defecto() -> [u8; 3] {
+    [72, 64, 96]
+}
+
 pub const RETARDO_MIN: u32 = 80;
 pub const RETARDO_MAX: u32 = 600;
 pub const TAMANO_MIN: f32 = 0.8;
 pub const TAMANO_MAX: f32 = 1.4;
 pub const ZONA_MIN: f32 = 20.0;
 pub const ZONA_MAX: f32 = 60.0;
+pub const OPACIDAD_MIN: f32 = 0.1;
+pub const OPACIDAD_MAX: f32 = 1.0;
+#[allow(dead_code)]
+pub const ACCESOS_MAX: usize = 8;
+#[allow(dead_code)]
+pub const ACCESOS_MIN: usize = 2;
 
 impl Config {
     /// Lleva cada valor a su rango; un JSON editado a mano no puede romper la rueda.
@@ -141,6 +165,11 @@ impl Config {
             self.zona_central.clamp(ZONA_MIN, ZONA_MAX)
         } else {
             zona_defecto()
+        };
+        self.opacidad_fondo = if self.opacidad_fondo.is_finite() {
+            self.opacidad_fondo.clamp(OPACIDAD_MIN, OPACIDAD_MAX)
+        } else {
+            opacidad_fondo_defecto()
         };
         // Los accesos sueltos de antes se vuelven un grupo más, editable y que se puede quitar.
         if !self.accesos.is_empty() {
@@ -166,6 +195,9 @@ impl Default for Config {
             tamano: tamano_defecto(),
             zona_central: zona_defecto(),
             oscurecer: true,
+            mostrar_nombres: mostrar_nombres_defecto(),
+            opacidad_fondo: opacidad_fondo_defecto(),
+            color_hover: color_hover_defecto(),
             grupos: vec![
                 Grupo {
                     nombre: "Sistema".into(),
@@ -299,6 +331,9 @@ mod tests {
         assert_eq!(cfg.tamano, 1.0);
         assert!(cfg.grupos.is_empty());
         assert_eq!(cfg.modo, Modo::Soltar);
+        assert_eq!(cfg.mostrar_nombres, true);
+        assert_eq!(cfg.opacidad_fondo, 0.88);
+        assert_eq!(cfg.color_hover, [72, 64, 96]);
     }
 
     #[test]
@@ -332,10 +367,11 @@ mod tests {
     #[test]
     fn normalizar_lleva_los_valores_a_su_rango() {
         let mut cfg: Config =
-            serde_json::from_str(r#"{"retardo_ms":5,"tamano":9.0,"zona_central":-3,"accesos":[]}"#).unwrap();
+            serde_json::from_str(r#"{"retardo_ms":5,"tamano":9.0,"zona_central":-3,"opacidad_fondo":0.0,"accesos":[]}"#).unwrap();
         cfg.normalizar();
         assert_eq!(cfg.retardo_ms, RETARDO_MIN);
         assert_eq!(cfg.tamano, TAMANO_MAX);
         assert_eq!(cfg.zona_central, ZONA_MIN);
+        assert_eq!(cfg.opacidad_fondo, OPACIDAD_MIN);
     }
 }
