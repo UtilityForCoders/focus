@@ -516,6 +516,9 @@ fn pintar(app: &mut App) {
         progreso: r.progreso,
         oscurecer: app.cfg.oscurecer,
         radio_central: app.cfg.zona_central * r.escala,
+        mostrar_nombres: app.cfg.mostrar_nombres,
+        color_hover: app.cfg.color_hover,
+        opacidad_fondo: app.cfg.opacidad_fondo,
     };
     if let Err(e) = app.renderer.dibujar(&escena) {
         eprintln!("dibujar: {e}");
