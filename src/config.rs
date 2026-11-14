@@ -28,6 +28,17 @@ pub enum Boton {
     Adelante,
 }
 
+/// Cómo se elige una app o un grupo con la rueda abierta.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Modo {
+    /// Se mantiene el botón, se apunta y se suelta.
+    Soltar,
+    /// El botón solo abre la rueda, que queda abierta al soltarlo: se elige con clic izquierdo y
+    /// se vuelve (o se cierra) con el derecho.
+    Clic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Acceso {
     /// Texto que se ve en el sector.
@@ -43,6 +54,19 @@ pub struct Acceso {
     pub icono: Option<String>,
 }
 
+/// Un grupo de accesos: en la rueda es una baldosa que, al elegirla, se abre y muestra sus
+/// accesos. La rueda principal solo tiene grupos.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Grupo {
+    pub nombre: String,
+    /// Ícono elegido a mano (`lucide:...` o `archivo:...`). Sin él, la baldosa muestra en
+    /// miniatura los íconos de sus primeros accesos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icono: Option<String>,
+    #[serde(default)]
+    pub accesos: Vec<Acceso>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "abrir_en_defecto")]
@@ -53,6 +77,8 @@ pub struct Config {
     pub retardo_ms: u32,
     #[serde(default = "boton_defecto")]
     pub boton: Boton,
+    #[serde(default = "modo_defecto")]
+    pub modo: Modo,
     /// Escala de la rueda: 1.0 es el tamaño normal.
     #[serde(default = "tamano_defecto")]
     pub tamano: f32,
@@ -62,7 +88,12 @@ pub struct Config {
     /// Oscurecer un poco la pantalla mientras la rueda está abierta.
     #[serde(default = "si")]
     pub oscurecer: bool,
+    /// Los grupos de la rueda principal.
     #[serde(default)]
+    pub grupos: Vec<Grupo>,
+    /// Accesos sueltos de versiones anteriores. Al cargar pasan a un grupo "Principal" y ya no se
+    /// escriben.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accesos: Vec<Acceso>,
 }
 
@@ -76,6 +107,10 @@ fn retardo_defecto() -> u32 {
 
 fn boton_defecto() -> Boton {
     Boton::Central
+}
+
+fn modo_defecto() -> Modo {
+    Modo::Soltar
 }
 
 fn tamano_defecto() -> f32 {
@@ -107,6 +142,11 @@ impl Config {
         } else {
             zona_defecto()
         };
+        // Los accesos sueltos de antes se vuelven un grupo más, editable y que se puede quitar.
+        if !self.accesos.is_empty() {
+            let accesos = std::mem::take(&mut self.accesos);
+            self.grupos.insert(0, Grupo { nombre: "Principal".into(), icono: None, accesos });
+        }
     }
 }
 
@@ -122,18 +162,44 @@ impl Default for Config {
             abrir_en: abrir_en_defecto(),
             retardo_ms: retardo_defecto(),
             boton: boton_defecto(),
+            modo: modo_defecto(),
             tamano: tamano_defecto(),
             zona_central: zona_defecto(),
             oscurecer: true,
-            accesos: vec![
-                acceso("Explorador", "explorer.exe"),
-                acceso("Navegador", "https://www.google.com"),
-                acceso("Bloc de notas", "notepad.exe"),
-                acceso("Calculadora", "calc.exe"),
-                acceso("Terminal", "cmd.exe"),
-                acceso("Descargas", "%USERPROFILE%\\Downloads"),
-                acceso("Ajustes", "ms-settings:"),
+            grupos: vec![
+                Grupo {
+                    nombre: "Sistema".into(),
+                    icono: Some("lucide:monitor".into()),
+                    accesos: vec![
+                        acceso("Explorador", "explorer.exe"),
+                        acceso("Navegador", "https://www.google.com"),
+                        acceso("Bloc de notas", "notepad.exe"),
+                        acceso("Calculadora", "calc.exe"),
+                        acceso("Terminal", "cmd.exe"),
+                        acceso("Descargas", "%USERPROFILE%\\Downloads"),
+                        acceso("Ajustes", "ms-settings:"),
+                    ],
+                },
+                Grupo {
+                    nombre: "Multimedia".into(),
+                    icono: Some("lucide:clapperboard".into()),
+                    accesos: vec![
+                        acceso("YouTube", "https://www.youtube.com"),
+                        acceso("Twitch", "https://www.twitch.tv"),
+                        acceso("Kick", "https://kick.com"),
+                    ],
+                },
+                Grupo {
+                    nombre: "Agentes de IA".into(),
+                    icono: Some("lucide:bot".into()),
+                    accesos: vec![
+                        acceso("Claude", "https://claude.ai"),
+                        acceso("ChatGPT", "https://chatgpt.com"),
+                        acceso("Gemini", "https://gemini.google.com"),
+                    ],
+                },
             ],
+            accesos: Vec::new(),
         }
     }
 }
@@ -231,6 +297,36 @@ mod tests {
         assert_eq!(cfg.boton, Boton::Central);
         assert!(cfg.oscurecer);
         assert_eq!(cfg.tamano, 1.0);
+        assert!(cfg.grupos.is_empty());
+        assert_eq!(cfg.modo, Modo::Soltar);
+    }
+
+    #[test]
+    fn los_accesos_sueltos_pasan_a_un_grupo_principal() {
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"modo":"clic","grupos":[{"nombre":"IA"}],"accesos":[{"nombre":"Notas","destino":"notepad.exe"}]}"#,
+        )
+        .unwrap();
+        cfg.normalizar();
+        assert_eq!(cfg.modo, Modo::Clic);
+        assert!(cfg.accesos.is_empty());
+        assert_eq!(cfg.grupos.len(), 2);
+        assert_eq!(cfg.grupos[0].nombre, "Principal");
+        assert_eq!(cfg.grupos[0].accesos[0].destino, "notepad.exe");
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("accesos").is_none());
+    }
+
+    #[test]
+    fn lee_grupos_con_sus_accesos() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"grupos":[{"nombre":"IA","accesos":[{"nombre":"Claude","destino":"https://claude.ai"}]},{"nombre":"Vacío"}],"accesos":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.grupos.len(), 2);
+        assert_eq!(cfg.grupos[0].accesos[0].nombre, "Claude");
+        assert!(cfg.grupos[1].accesos.is_empty());
+        assert_eq!(cfg.grupos[1].icono, None);
     }
 
     #[test]

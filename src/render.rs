@@ -9,7 +9,8 @@
 //! Todo se mide en píxeles físicos: la escala (DPI del monitor por el tamaño elegido) llega en
 //! `Escena::escala` y se aplica a las medidas, no al render target (que trabaja a 96 ppp).
 
-use crate::icons::Visual;
+use crate::config::{Config, Grupo};
+use crate::icons::{self, Visual};
 use crate::ui::{self, glifo, rect, rgba, tema, Alin, Peso, Pintor, Rect};
 use crate::wheel::{self, BALDOSA};
 use windows::core::{Interface, Result};
@@ -21,15 +22,48 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
 use windows_numerics::Matrix3x2;
 
+/// Una baldosa de la rueda: un acceso o un grupo.
+#[derive(Clone)]
+pub struct Baldosa {
+    pub nombre: String,
+    /// Sin ícono se dibuja la inicial (o, en un grupo, las miniaturas de sus accesos).
+    pub visual: Option<Visual>,
+    /// En un grupo, los íconos de sus primeros accesos; `None` si es un acceso.
+    pub grupo: Option<Vec<Option<Visual>>>,
+}
+
+impl Baldosa {
+    pub fn es_grupo(&self) -> bool {
+        self.grupo.is_some()
+    }
+}
+
+/// Baldosas de la rueda principal: los grupos (y accesos sueltos, si un config viejo los trae).
+pub fn baldosas_raiz(cfg: &Config) -> Vec<Baldosa> {
+    let grupos = cfg.grupos.iter().map(|g| Baldosa {
+        nombre: g.nombre.clone(),
+        visual: g.icono.as_deref().and_then(icons::visual_propio),
+        grupo: Some(g.accesos.iter().take(4).map(icons::visual).collect()),
+    });
+    let sueltos = cfg.accesos.iter().map(|a| Baldosa { nombre: a.nombre.clone(), visual: icons::visual(a), grupo: None });
+    grupos.chain(sueltos).collect()
+}
+
+/// Baldosas de un grupo abierto.
+pub fn baldosas_grupo(g: &Grupo) -> Vec<Baldosa> {
+    g.accesos.iter().map(|a| Baldosa { nombre: a.nombre.clone(), visual: icons::visual(a), grupo: None }).collect()
+}
+
 /// Lo que hace falta para pintar un fotograma.
 pub struct Escena<'a> {
     /// Centro de la rueda, relativo a la esquina de la ventana.
     pub centro: (f32, f32),
     /// DPI del monitor / 96, multiplicado por el tamaño elegido en ajustes.
     pub escala: f32,
-    pub nombres: &'a [String],
-    /// Ícono de cada acceso (mismo orden que `nombres`); sin ícono se dibuja la inicial.
-    pub iconos: &'a [Option<Visual>],
+    pub baldosas: &'a [Baldosa],
+    /// Nombre del grupo abierto; `None` en la rueda principal. Con un grupo abierto, el botón
+    /// central muestra "volver".
+    pub grupo: Option<&'a str>,
     pub seleccion: Option<usize>,
     /// Progreso de la animación de apertura, de 0 a 1 (ya suavizado).
     pub progreso: f32,
@@ -173,7 +207,7 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     let m = Matrix3x2 { M11: z, M12: 0.0, M21: 0.0, M22: z, M31: cx * (1.0 - z), M32: cy * (1.0 - z) };
     unsafe { p.rt.SetTransform(&(m * previa)) };
 
-    let n = e.nombres.len();
+    let n = e.baldosas.len();
     // Las baldosas salen desde el centro hacia su sitio.
     let radio = wheel::radio_anillo(n) * s * (0.55 + 0.45 * e.progreso);
 
@@ -183,7 +217,18 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     p.circulo(cx, cy + 1.5 * s, rc + 1.0 * s, rgba(0, 0, 0, 0.25));
     p.circulo(cx, cy, rc, CENTRO_FONDO);
     p.borde_circulo(cx, cy, rc - 0.5, if en_centro { tema::BORDE_FUERTE } else { tema::BORDE }, 1.0);
-    p.glifo(glifo::CERRAR, cx, cy, 12.0 * s, if en_centro { tema::TEXTO } else { tema::TEXTO_2 });
+    let g_centro = if e.grupo.is_some() { glifo::ATRAS } else { glifo::CERRAR };
+    p.glifo(g_centro, cx, cy, 12.0 * s, if en_centro { tema::TEXTO } else { tema::TEXTO_2 });
+    // Dentro de un grupo, su nombre bajo el botón central.
+    if let Some(nombre) = e.grupo {
+        let tam = 11.0 * s;
+        let (alto_e, pad) = (22.0 * s, 9.0 * s);
+        let ancho_e = (p.medir(nombre, tam, Peso::Semi) + 2.0 * pad).min(180.0 * s);
+        let caja = rect(cx - ancho_e / 2.0, cy + rc + 10.0 * s, ancho_e, alto_e);
+        p.rellenar(caja, alto_e / 2.0, CENTRO_FONDO);
+        p.bordear(caja, alto_e / 2.0, tema::BORDE, 1.0);
+        p.texto(nombre, rect(caja.left + pad, caja.top, ancho_e - 2.0 * pad, alto_e), tam, Peso::Semi, Alin::Centro, tema::TEXTO);
+    }
 
     let mut etiqueta: Option<(Rect, f32, f32)> = None;
     for i in 0..n {
@@ -194,21 +239,44 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
         let r = rect(bx - lado / 2.0, by - lado / 2.0, lado, lado);
         let esquina = lado * 0.27;
 
+        let b = &e.baldosas[i];
+
+        // Un grupo se ve como una pila: otra baldosa asoma detrás, hacia fuera de la rueda.
+        if b.es_grupo() {
+            let (ox, oy) = (a.cos() * 5.0 * s, a.sin() * 5.0 * s);
+            let detras = rect(r.left + ox, r.top + oy, lado, lado);
+            p.rellenar(detras, esquina, BALDOSA_FONDO);
+            p.bordear(detras, esquina, BALDOSA_BORDE, 1.0);
+        }
         p.sombra(r, esquina, if activa { 1.6 } else { 1.0 });
         p.rellenar(r, esquina, if activa { BALDOSA_FONDO_ACTIVA } else { BALDOSA_FONDO });
         p.bordear(r, esquina, if activa { BALDOSA_BORDE_ACTIVA } else { BALDOSA_BORDE }, 1.0);
 
-        match e.iconos.get(i).and_then(|x| x.as_ref()) {
-            Some(Visual::Imagen(icono)) => {
-                let li = lado * 0.58;
-                p.imagen(icono, rect(bx - li / 2.0, by - li / 2.0, li, li), 1.0);
+        match (&b.visual, &b.grupo) {
+            (Some(v), _) => pintar_visual(p, v, bx, by, lado),
+            (None, Some(sub)) if !sub.is_empty() => {
+                // Hasta cuatro miniaturas en una cuadrícula de 2 x 2.
+                let celda = lado * 0.30;
+                let paso = celda + lado * 0.06;
+                let filas = sub.len().min(4).div_ceil(2) as f32;
+                for (k, v) in sub.iter().enumerate().take(4) {
+                    let (fx, fy) = ((k % 2) as f32, (k / 2) as f32);
+                    let mx = bx + (fx - 0.5) * paso;
+                    let my = by + (fy - (filas - 1.0) / 2.0) * paso;
+                    match v {
+                        Some(v) => pintar_visual(p, v, mx, my, celda / 0.58),
+                        None => p.rellenar(rect(mx - celda / 2.0, my - celda / 2.0, celda, celda), celda * 0.25, tema::CONTROL_ACTIVO),
+                    }
+                }
             }
-            Some(Visual::Lucide(nombre)) => {
+            (None, Some(_)) => {
                 let li = lado * 0.46;
-                p.lucide(nombre, rect(bx - li / 2.0, by - li / 2.0, li, li), tema::TEXTO);
+                if let Some(n) = crate::lucide::nombre("folder") {
+                    p.lucide(n, rect(bx - li / 2.0, by - li / 2.0, li, li), tema::TEXTO);
+                }
             }
-            None => {
-                let inicial: String = e.nombres[i].chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+            (None, None) => {
+                let inicial: String = b.nombre.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
                 p.texto(&inicial, r, 20.0 * s, Peso::Semi, Alin::Centro, tema::TEXTO);
             }
         }
@@ -220,7 +288,7 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     // Etiqueta con el nombre, hacia fuera de la rueda: a un lado si la baldosa está a la
     // izquierda o a la derecha, encima o debajo si está arriba o abajo.
     if let (Some((r, cos, sin)), Some(i)) = (etiqueta, e.seleccion) {
-        let nombre = &e.nombres[i];
+        let nombre = &e.baldosas[i].nombre;
         let tam = 12.5 * s;
         let (alto_e, pad) = (26.0 * s, 11.0 * s);
         let ancho_e = (p.medir(nombre, tam, Peso::Semi) + 2.0 * pad).min(260.0 * s);
@@ -242,10 +310,25 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
     }
 
     if n == 0 {
-        let caja = rect(cx - 200.0 * s, cy + 40.0 * s, 400.0 * s, 24.0 * s);
-        p.texto("Sin accesos: agrégalos en los ajustes", caja, 12.5 * s, Peso::Medio, Alin::Centro, tema::TEXTO);
+        let caja = rect(cx - 200.0 * s, cy + 70.0 * s, 400.0 * s, 24.0 * s);
+        let aviso = if e.grupo.is_some() { "Grupo vacío: vuelve al centro para salir" } else { "Sin accesos: agrégalos en los ajustes" };
+        p.texto(aviso, caja, 12.5 * s, Peso::Medio, Alin::Centro, tema::TEXTO);
     }
     unsafe { p.rt.SetTransform(&previa) };
+}
+
+/// Ícono de una baldosa de lado `lado` centrada en (`cx`, `cy`).
+fn pintar_visual(p: &mut Pintor, v: &Visual, cx: f32, cy: f32, lado: f32) {
+    match v {
+        Visual::Imagen(icono) => {
+            let li = lado * 0.58;
+            p.imagen(icono, rect(cx - li / 2.0, cy - li / 2.0, li, li), 1.0);
+        }
+        Visual::Lucide(nombre) => {
+            let li = lado * 0.46;
+            p.lucide(nombre, rect(cx - li / 2.0, cy - li / 2.0, li, li), tema::TEXTO);
+        }
+    }
 }
 
 impl Drop for Renderer {

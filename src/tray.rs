@@ -1,16 +1,11 @@
-//! Ícono en el área de notificación, con un menú para editar los accesos y salir.
+//! Ícono en el área de notificación. El clic izquierdo abre los ajustes y el derecho, el menú
+//! propio de `menu.rs`.
 
-use windows::core::w;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_FOCUS_TRAY: u32 = WM_APP + 10;
-
-pub const CMD_EDITAR: usize = 1;
-pub const CMD_CARPETA: usize = 2;
-pub const CMD_SALIR: usize = 3;
-pub const CMD_CONFIGURAR: usize = 4;
 
 fn datos(hwnd: HWND) -> NOTIFYICONDATAW {
     let mut nid = NOTIFYICONDATAW {
@@ -38,35 +33,5 @@ pub fn quitar(hwnd: HWND) {
     unsafe {
         let nid = datos(hwnd);
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-    }
-}
-
-/// Muestra el menú en el puntero y devuelve el comando elegido (0 si se cerró sin elegir).
-pub fn menu(hwnd: HWND) -> usize {
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return 0 };
-        let _ = AppendMenuW(menu, MF_STRING, CMD_CONFIGURAR, w!("Configurar accesos…"));
-        // En negrita: es lo mismo que hace el clic izquierdo en el ícono.
-        let _ = SetMenuDefaultItem(menu, CMD_CONFIGURAR as u32, 0);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, CMD_EDITAR, w!("Abrir config.json"));
-        let _ = AppendMenuW(menu, MF_STRING, CMD_CARPETA, w!("Abrir carpeta de configuración"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, CMD_SALIR, w!("Salir"));
-        let mut p = POINT::default();
-        let _ = GetCursorPos(&mut p);
-        // Sin esto el menú no se cierra al hacer clic fuera de él.
-        let _ = SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-            p.x,
-            p.y,
-            None,
-            hwnd,
-            None,
-        );
-        let _ = DestroyMenu(menu);
-        cmd.0 as usize
     }
 }

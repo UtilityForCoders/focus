@@ -58,6 +58,10 @@ pub mod glifo {
     pub const CERRAR: char = '\u{E711}';
     pub const CARPETA: char = '\u{E838}';
     pub const RECARGAR: char = '\u{E72C}';
+    pub const ATRAS: char = '\u{E72B}';
+    pub const IZQUIERDA: char = '\u{E76B}';
+    pub const DERECHA: char = '\u{E76C}';
+    pub const APAGAR: char = '\u{E7E8}';
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

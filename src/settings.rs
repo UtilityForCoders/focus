@@ -2,7 +2,8 @@
 //!
 //! A la izquierda, una barra con las secciones; a la derecha, filas con título, descripción y
 //! un control (interruptor, selector segmentado o deslizador). En "Accesos", todas las apps
-//! instaladas con su ícono y buscador, y la lista de la rueda con su editor.
+//! instaladas con su ícono y buscador, los grupos, y la lista elegida (la rueda principal o un
+//! grupo) con su editor.
 //!
 //! **Cómo está hecha.** Es una interfaz de modo inmediato: cada `WM_PAINT` dibuja todo desde el
 //! estado y, de paso, apunta en `zonas` qué rectángulo hace qué. El ratón se resuelve contra esas
@@ -18,7 +19,7 @@
 
 use crate::apps::{self, AppInstalada};
 use crate::autostart;
-use crate::config::{self, AbrirEn, Acceso, Boton, Config};
+use crate::config::{self, AbrirEn, Acceso, Boton, Config, Grupo, Modo};
 use crate::icons::{self, Icono, IconoRef};
 use crate::lucide;
 use std::collections::HashMap;
@@ -85,6 +86,7 @@ enum CampoId {
     Args = 3,
     BuscarIcono = 4,
     Archivo = 5,
+    NombreGrupo = 6,
 }
 
 /// Pestañas del selector de íconos.
@@ -110,6 +112,7 @@ enum Accion {
     Seccion(Seccion),
     AbrirEn(AbrirEn),
     Boton(Boton),
+    Modo(Modo),
     Deslizador(Desliz),
     InicioWindows,
     Oscurecer,
@@ -125,6 +128,7 @@ enum Accion {
     Recargar,
     AbrirConfig,
     AbrirCarpeta,
+    Salir,
     AbrirSelector,
     CerrarSelector,
     /// Zona que solo tapa lo de debajo (el panel del selector).
@@ -134,6 +138,13 @@ enum Accion {
     ElegirLucide(usize),
     ElegirArchivo(i32),
     ExaminarIconos,
+    /// Qué lista se edita: la rueda principal (`None`) o un grupo.
+    Contexto(Option<usize>),
+    NuevoGrupo,
+    GrupoIzquierda,
+    GrupoDerecha,
+    QuitarGrupo,
+    IconoGrupo,
 }
 
 /// Lo que hay que hacer después de soltar el estado (diálogos con su propio bucle de mensajes).
@@ -248,7 +259,7 @@ struct Ajustes {
     /// Posiciones en `apps` que pasan el filtro de búsqueda, en orden.
     filtradas: Vec<usize>,
 
-    campos: [Campo; 6],
+    campos: [Campo; 7],
     foco: Option<CampoId>,
     cursor_visible: bool,
     /// Primera mitad de un carácter fuera del plano básico (WM_CHAR llega en dos partes).
@@ -256,6 +267,12 @@ struct Ajustes {
     seleccion: Option<usize>,
     /// Ícono elegido en el editor (`lucide:...` o `archivo:...`); `None` es el automático.
     icono_editor: Option<String>,
+    /// Grupo cuya lista se edita; `None` es la rueda principal.
+    grupo: Option<usize>,
+    /// El selector de íconos está eligiendo el del grupo, no el del acceso.
+    selector_grupo: bool,
+    /// Se pulsó "quitar grupo" una vez: el segundo clic lo borra.
+    confirmar_quitar: bool,
 
     selector: Option<ModoSel>,
     scroll_sel: f32,
@@ -305,6 +322,16 @@ pub fn abrir(principal: HWND) {
     }
     if let Err(e) = crear(principal) {
         eprintln!("no se pudo abrir los ajustes: {e}");
+    }
+}
+
+/// Cierra la ventana si está abierta (al salir de Focus).
+pub fn cerrar() {
+    let v = VENTANA.load(Ordering::Relaxed);
+    if v != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(v as *mut _));
+        }
     }
 }
 
@@ -385,6 +412,9 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
             sustituto: None,
             seleccion: None,
             icono_editor: None,
+            grupo: None,
+            selector_grupo: false,
+            confirmar_quitar: false,
             selector: None,
             scroll_sel: 0.0,
             max_sel: 0.0,
@@ -415,6 +445,7 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
             None => apps::cargar_en_segundo_plano(hwnd, WM_APPS_LISTA, WM_APPS_ICONOS),
         }
         a.filtrar();
+        a.ir_a((!a.cfg.grupos.is_empty()).then_some(0));
 
         AJUSTES.with(|s| *s.borrow_mut() = Some(a));
         VENTANA.store(hwnd.0 as isize, Ordering::Relaxed);
@@ -453,17 +484,51 @@ impl Ajustes {
         self.scroll_apps = 0.0;
     }
 
+    /// Accesos de la lista que se está editando (la rueda principal o un grupo).
+    fn lista(&self) -> &Vec<Acceso> {
+        match self.grupo.and_then(|g| self.cfg.grupos.get(g)) {
+            Some(g) => &g.accesos,
+            None => &self.cfg.accesos,
+        }
+    }
+
+    fn lista_mut(&mut self) -> &mut Vec<Acceso> {
+        match self.grupo {
+            Some(g) if g < self.cfg.grupos.len() => &mut self.cfg.grupos[g].accesos,
+            _ => &mut self.cfg.accesos,
+        }
+    }
+
     fn en_rueda(&self, destino: &str) -> bool {
-        self.cfg.accesos.iter().any(|a| a.destino == destino)
+        self.lista().iter().any(|a| a.destino == destino)
+    }
+
+    /// Cambia la lista que se edita.
+    fn ir_a(&mut self, grupo: Option<usize>) {
+        self.grupo = grupo.filter(|&g| g < self.cfg.grupos.len());
+        self.scroll_accesos = 0.0;
+        self.foco = None;
+        let nombre = self.grupo.map(|g| self.cfg.grupos[g].nombre.clone()).unwrap_or_default();
+        self.campo(CampoId::NombreGrupo).poner(&nombre);
+        self.elegir(None);
+    }
+
+    /// Ícono que muestra marcado el selector: el del grupo o el del editor.
+    fn icono_objetivo(&self) -> Option<String> {
+        if self.selector_grupo {
+            self.grupo.and_then(|g| self.cfg.grupos.get(g)).and_then(|g| g.icono.clone())
+        } else {
+            self.icono_editor.clone()
+        }
     }
 
     fn elegir(&mut self, i: Option<usize>) {
-        self.seleccion = i.filter(|&i| i < self.cfg.accesos.len());
-        let (n, d, a) = match self.seleccion.map(|i| &self.cfg.accesos[i]) {
+        self.seleccion = i.filter(|&i| i < self.lista().len());
+        let (n, d, a) = match self.seleccion.map(|i| &self.lista()[i]) {
             Some(x) => (x.nombre.clone(), x.destino.clone(), x.argumentos.clone().unwrap_or_default()),
             None => Default::default(),
         };
-        self.icono_editor = self.seleccion.and_then(|i| self.cfg.accesos[i].icono.clone());
+        self.icono_editor = self.seleccion.and_then(|i| self.lista()[i].icono.clone());
         self.campo(CampoId::Nombre).poner(&n);
         self.campo(CampoId::Destino).poner(&d);
         self.campo(CampoId::Args).poner(&a);
@@ -471,11 +536,18 @@ impl Ajustes {
 
     /// Cambia el ícono del editor; si se está editando un acceso, se guarda ya.
     fn poner_icono(&mut self, icono: Option<String>) {
-        self.icono_editor = icono;
         self.selector = None;
         self.foco = None;
+        if self.selector_grupo {
+            if let Some(g) = self.grupo.filter(|&g| g < self.cfg.grupos.len()) {
+                self.cfg.grupos[g].icono = icono;
+                self.guardar();
+            }
+            return;
+        }
+        self.icono_editor = icono;
         if let Some(i) = self.seleccion {
-            self.cfg.accesos[i].icono = self.icono_editor.clone();
+            self.lista_mut()[i].icono = self.icono_editor.clone();
             self.guardar();
         }
     }
@@ -487,7 +559,7 @@ impl Ajustes {
     }
 
     fn abrir_selector(&mut self) {
-        let modo = match self.icono_editor.clone() {
+        let modo = match self.icono_objetivo() {
             Some(i) if i.starts_with("archivo:") => {
                 if let Some((ruta, _)) = icons::partir_archivo(&i["archivo:".len()..]) {
                     self.campo(CampoId::Archivo).poner(&ruta);
@@ -511,15 +583,25 @@ impl Ajustes {
         }
     }
 
+    /// Sin grupos no hay dónde poner un acceso: se crea uno.
+    fn asegurar_grupo(&mut self) {
+        if self.grupo.is_none() {
+            self.cfg.grupos.push(Grupo { nombre: "Principal".into(), icono: None, accesos: Vec::new() });
+            self.ir_a(Some(self.cfg.grupos.len() - 1));
+        }
+    }
+
     fn agregar_app(&mut self, i: usize) {
+        self.asegurar_grupo();
         let Some(app) = self.apps.get(i) else { return };
-        if let Some(ya) = self.cfg.accesos.iter().position(|a| a.destino == app.destino) {
+        if let Some(ya) = self.lista().iter().position(|a| a.destino == app.destino) {
             self.elegir(Some(ya));
             return;
         }
-        self.cfg.accesos.push(Acceso { nombre: app.nombre.clone(), destino: app.destino.clone(), argumentos: None, icono: None });
+        let nuevo = Acceso { nombre: app.nombre.clone(), destino: app.destino.clone(), argumentos: None, icono: None };
+        self.lista_mut().push(nuevo);
         self.guardar();
-        self.elegir(Some(self.cfg.accesos.len() - 1));
+        self.elegir(Some(self.lista().len() - 1));
         // Que el recién agregado quede a la vista.
         self.scroll_accesos = f32::MAX;
     }
@@ -536,11 +618,15 @@ impl Ajustes {
             return;
         }
         let acceso = Acceso { nombre, destino, argumentos: (!args.is_empty()).then_some(args), icono: self.icono_editor.clone() };
+        if self.grupo.is_none() {
+            // `ir_a` limpia el editor, pero el acceso ya está leído.
+            self.asegurar_grupo();
+        }
         match self.seleccion {
-            Some(i) => self.cfg.accesos[i] = acceso,
+            Some(i) => self.lista_mut()[i] = acceso,
             None => {
-                self.cfg.accesos.push(acceso);
-                self.seleccion = Some(self.cfg.accesos.len() - 1);
+                self.lista_mut().push(acceso);
+                self.seleccion = Some(self.lista().len() - 1);
                 self.scroll_accesos = f32::MAX;
             }
         }
@@ -568,6 +654,9 @@ impl Ajustes {
 
     /// Ejecuta un clic. Lo que necesita un bucle de mensajes propio se devuelve para después.
     fn ejecutar(&mut self, accion: Accion) -> Option<Diferida> {
+        if accion != Accion::QuitarGrupo {
+            self.confirmar_quitar = false;
+        }
         match accion {
             Accion::Seccion(s) => {
                 self.seccion = s;
@@ -576,6 +665,10 @@ impl Ajustes {
             }
             Accion::AbrirEn(v) => {
                 self.cfg.abrir_en = v;
+                self.guardar();
+            }
+            Accion::Modo(m) => {
+                self.cfg.modo = m;
                 self.guardar();
             }
             Accion::Boton(b) => {
@@ -593,20 +686,61 @@ impl Ajustes {
             Accion::AgregarApp(i) => self.agregar_app(i),
             Accion::Elegir(i) => self.elegir(Some(i)),
             Accion::Subir(i) if i > 0 => {
-                self.cfg.accesos.swap(i, i - 1);
+                self.lista_mut().swap(i, i - 1);
                 self.guardar();
                 self.elegir(Some(i - 1));
             }
-            Accion::Bajar(i) if i + 1 < self.cfg.accesos.len() => {
-                self.cfg.accesos.swap(i, i + 1);
+            Accion::Bajar(i) if i + 1 < self.lista().len() => {
+                self.lista_mut().swap(i, i + 1);
                 self.guardar();
                 self.elegir(Some(i + 1));
             }
-            Accion::Quitar(i) if i < self.cfg.accesos.len() => {
-                self.cfg.accesos.remove(i);
+            Accion::Quitar(i) if i < self.lista().len() => {
+                self.lista_mut().remove(i);
                 self.guardar();
-                let n = self.cfg.accesos.len();
+                let n = self.lista().len();
                 self.elegir((n > 0).then(|| i.min(n - 1)));
+            }
+            Accion::Contexto(g) => self.ir_a(g),
+            Accion::NuevoGrupo => {
+                self.cfg.grupos.push(Grupo { nombre: "Nuevo grupo".into(), icono: None, accesos: Vec::new() });
+                self.guardar();
+                self.ir_a(Some(self.cfg.grupos.len() - 1));
+                // El nombre queda seleccionado: lo que se escriba lo reemplaza.
+                self.foco = Some(CampoId::NombreGrupo);
+                self.campo(CampoId::NombreGrupo).todo = true;
+            }
+            Accion::GrupoIzquierda => {
+                if let Some(g) = self.grupo.filter(|&g| g > 0 && g < self.cfg.grupos.len()) {
+                    self.cfg.grupos.swap(g, g - 1);
+                    self.grupo = Some(g - 1);
+                    self.guardar();
+                }
+            }
+            Accion::GrupoDerecha => {
+                if let Some(g) = self.grupo.filter(|&g| g + 1 < self.cfg.grupos.len()) {
+                    self.cfg.grupos.swap(g, g + 1);
+                    self.grupo = Some(g + 1);
+                    self.guardar();
+                }
+            }
+            Accion::QuitarGrupo => {
+                if let Some(g) = self.grupo.filter(|&g| g < self.cfg.grupos.len()) {
+                    // Un grupo puede tener muchos accesos: hace falta un segundo clic.
+                    if !self.confirmar_quitar {
+                        self.confirmar_quitar = true;
+                    } else {
+                        self.confirmar_quitar = false;
+                        self.cfg.grupos.remove(g);
+                        self.guardar();
+                        let n = self.cfg.grupos.len();
+                        self.ir_a((n > 0).then(|| g.min(n - 1)));
+                    }
+                }
+            }
+            Accion::IconoGrupo => {
+                self.selector_grupo = true;
+                self.abrir_selector();
             }
             Accion::Guardar => self.guardar_formulario(),
             Accion::Nuevo => {
@@ -621,7 +755,10 @@ impl Ajustes {
             }
             Accion::Examinar => return Some(Diferida::Examinar),
             Accion::ExaminarIconos => return Some(Diferida::ExaminarIconos),
-            Accion::AbrirSelector => self.abrir_selector(),
+            Accion::AbrirSelector => {
+                self.selector_grupo = false;
+                self.abrir_selector();
+            }
             Accion::CerrarSelector => {
                 self.selector = None;
                 self.foco = None;
@@ -641,6 +778,10 @@ impl Ajustes {
                     icono: None,
                 }))
             }
+            Accion::Salir => unsafe {
+                // La ventana principal cierra todo (ganchos, esta ventana) al destruirse.
+                let _ = PostMessageW(Some(self.principal), WM_CLOSE, WPARAM(0), LPARAM(0));
+            },
             Accion::AbrirCarpeta => {
                 let dir = config::ruta().parent().map(|d| d.display().to_string()).unwrap_or_default();
                 return Some(Diferida::Abrir(Acceso { nombre: String::new(), destino: dir, argumentos: None, icono: None }));
@@ -962,7 +1103,18 @@ impl Ajustes {
             ("Adelante", Accion::Boton(Boton::Adelante), b == Boton::Adelante),
         ]);
         y = sig;
-        let (cy, sig) = self.fila(p, x, y, cw, "Zona para cancelar", "Radio del círculo central: si sueltas dentro, no se abre nada.");
+        let m = self.cfg.modo;
+        let desc = match m {
+            Modo::Soltar => "Apuntas y sueltas. Un grupo se abre al apuntarlo.",
+            Modo::Clic => "El botón abre la rueda; eliges con clic izquierdo.",
+        };
+        let (cy, sig) = self.fila(p, x, y, cw, "Elegir con", desc);
+        self.segmentado(p, x + cw - 16.0, cy, &[
+            ("Soltar el botón", Accion::Modo(Modo::Soltar), m == Modo::Soltar),
+            ("Clic", Accion::Modo(Modo::Clic), m == Modo::Clic),
+        ]);
+        y = sig;
+        let (cy, sig) = self.fila(p, x, y, cw, "Zona central", "Círculo del centro: cancela o vuelve atrás.");
         let v = (self.cfg.zona_central - config::ZONA_MIN) / (config::ZONA_MAX - config::ZONA_MIN);
         let texto = format!("{} px", self.cfg.zona_central as i32);
         self.deslizador(p, x + cw - 16.0, cy, Desliz::Zona, v, &texto);
@@ -990,18 +1142,17 @@ impl Ajustes {
         let caja = rect(x, y, cw, (h - y - 24.0).max(120.0));
         p.rellenar(caja, 12.0, rgba(0, 0, 0, 0.25));
         p.bordear(caja, 12.0, tema::BORDE, 1.0);
-        let nombres: Vec<String> = self.cfg.accesos.iter().map(|a| a.nombre.clone()).collect();
-        let iconos: Vec<_> = self.cfg.accesos.iter().map(icons::visual).collect();
+        let baldosas = render::baldosas_raiz(&self.cfg);
         // Cabe en la caja: si la rueda es más grande que el espacio, se reduce solo en la vista.
-        let alcance = crate::wheel::alcance(nombres.len()) * self.cfg.tamano;
+        let alcance = crate::wheel::alcance(baldosas.len()) * self.cfg.tamano;
         let lado = (caja.right - caja.left).min(caja.bottom - caja.top);
         let ajuste = (lado / 2.0 / alcance).min(1.0);
         let escena = Escena {
             centro: ((caja.left + caja.right) / 2.0, (caja.top + caja.bottom) / 2.0),
             escala: self.cfg.tamano * ajuste,
-            nombres: &nombres,
-            iconos: &iconos,
-            seleccion: (!nombres.is_empty()).then_some(0),
+            baldosas: &baldosas,
+            grupo: None,
+            seleccion: (!baldosas.is_empty()).then_some(0),
             progreso: 1.0,
             oscurecer: false,
             radio_central: self.cfg.zona_central * self.cfg.tamano * ajuste,
@@ -1012,7 +1163,7 @@ impl Ajustes {
     }
 
     fn accesos(&mut self, p: &mut Pintor, x: f32, cw: f32, h: f32) {
-        let y = self.titulo(p, x, cw, "Accesos", "Elige qué aparece en la rueda. El orden sigue las agujas del reloj, empezando arriba.");
+        let y = self.titulo(p, x, cw, "Accesos", "La rueda muestra tus grupos; cada grupo, sus apps. El orden sigue las agujas del reloj, desde arriba.");
         let sep = 24.0;
         let col = (cw - sep) / 2.0;
         let (xi, xd) = (x, x + col + sep);
@@ -1064,16 +1215,21 @@ impl Ajustes {
         p.fin_recorte();
         self.barra(p, interior, self.scroll_apps, self.max_apps);
 
-        // ── Derecha: la rueda y el editor ──
-        let n = self.cfg.accesos.len();
-        let cuenta = match n {
-            0 => "En la rueda".to_string(),
-            n if n > RECOMENDADO => format!("En la rueda · {n} (se recomiendan hasta {RECOMENDADO})"),
-            n => format!("En la rueda · {n}"),
+        // ── Derecha: grupos, la lista elegida y el editor ──
+        let n = self.lista().len();
+        let cuenta = match (self.grupo, n) {
+            (None, _) => "Sin grupos".to_string(),
+            (Some(_), 0) => "En el grupo".to_string(),
+            (Some(_), n) if n > RECOMENDADO => format!("En el grupo · {n} (se recomiendan hasta {RECOMENDADO})"),
+            (Some(_), n) => format!("En el grupo · {n}"),
         };
         p.texto(&cuenta, rect(xd, y, col, 24.0), 13.5, Peso::Semi, Alin::Izq, tema::TEXTO);
+        let mut yd = self.pestanas_grupos(p, xd, y + 32.0, col);
+        if self.grupo.is_some() {
+            yd = self.barra_grupo(p, xd, yd, col);
+        }
         let alto_editor = 278.0;
-        let area = rect(xd, y + 34.0, col, h - y - 34.0 - 24.0 - alto_editor - 14.0);
+        let area = rect(xd, yd, col, (h - yd - 24.0 - alto_editor - 14.0).max(60.0));
         self.area_accesos = area;
         p.rellenar(area, 10.0, rgba(0, 0, 0, 0.18));
         p.bordear(area, 10.0, tema::BORDE, 1.0);
@@ -1083,7 +1239,8 @@ impl Ajustes {
         self.scroll_accesos = self.scroll_accesos.clamp(0.0, self.max_accesos);
         p.recortar(interior);
         if n == 0 {
-            p.texto("Agrega apps desde la lista de la izquierda", interior, 13.0, Peso::Normal, Alin::Centro, tema::TEXTO_2);
+            let aviso = if self.grupo.is_some() { "Grupo vacío: agrega apps desde la izquierda" } else { "Crea un grupo, o agrega una app y se crea uno" };
+            p.texto(aviso, interior, 13.0, Peso::Normal, Alin::Centro, tema::TEXTO_2);
         }
         for i in 0..n {
             let ry = interior.top + i as f32 * FILA_ACCESO - self.scroll_accesos;
@@ -1100,7 +1257,7 @@ impl Ajustes {
             }
             let rz = rect(r.left, ry.max(interior.top), r.right - r.left, (ry + FILA_ACCESO).min(interior.bottom) - ry.max(interior.top));
             self.zona(rz, Accion::Elegir(i));
-            let acceso = self.cfg.accesos[i].clone();
+            let acceso = self.lista()[i].clone();
             p.texto(&format!("{}", i + 1), rect(r.left + 6.0, ry, 18.0, FILA_ACCESO), 11.5, Peso::Normal, Alin::Centro, tema::TEXTO_3);
             match icons::visual(&acceso) {
                 Some(v) => p.visual(&v, rect(r.left + 30.0, ry + 9.0, 26.0, 26.0), tema::TEXTO),
@@ -1170,6 +1327,94 @@ impl Ajustes {
         self.boton(p, rect(xc + wb + 10.0, fy + 4.0, wb, 34.0), "Nuevo", Some(glifo::MAS), false, Accion::Nuevo);
     }
 
+    /// Pastillas para elegir qué grupo se edita, y "+ Grupo".
+    /// Si no caben en una fila, siguen en la de abajo. Devuelve dónde sigue el contenido.
+    fn pestanas_grupos(&mut self, p: &mut Pintor, x: f32, y: f32, ancho: f32) -> f32 {
+        let alto = 28.0;
+        let mut items: Vec<(String, Accion, bool)> = Vec::new();
+        for (i, g) in self.cfg.grupos.iter().enumerate() {
+            let nombre = if g.nombre.trim().is_empty() { "Sin nombre".to_string() } else { g.nombre.clone() };
+            items.push((nombre, Accion::Contexto(Some(i)), self.grupo == Some(i)));
+        }
+        let (mut cx, mut cy) = (x, y);
+        for (texto, accion, sel) in items {
+            let w = (p.medir(&texto, 12.5, Peso::Medio) + 26.0).min(ancho);
+            if cx > x && cx + w > x + ancho {
+                cx = x;
+                cy += alto + 6.0;
+            }
+            let r = rect(cx, cy, w, alto);
+            let sobre = self.hover == Some(accion);
+            if sel {
+                p.rellenar(r, alto / 2.0, tema::CLARO);
+            } else {
+                p.rellenar(r, alto / 2.0, if sobre { tema::CONTROL_ACTIVO } else { tema::CONTROL_HOVER });
+                p.bordear(r, alto / 2.0, tema::BORDE, 1.0);
+            }
+            let c = if sel { tema::TEXTO_OSCURO } else if sobre { tema::TEXTO } else { tema::TEXTO_2 };
+            p.texto(&texto, rect(r.left + 13.0, r.top, w - 26.0, alto), 12.5, Peso::Medio, Alin::Centro, c);
+            self.zona(r, accion);
+            cx += w + 6.0;
+        }
+        // "+ Grupo"
+        let w = 84.0;
+        if cx > x && cx + w > x + ancho {
+            cx = x;
+            cy += alto + 6.0;
+        }
+        let r = rect(cx, cy, w, alto);
+        let sobre = self.hover == Some(Accion::NuevoGrupo);
+        p.rellenar(r, alto / 2.0, if sobre { tema::CONTROL_ACTIVO } else { rgba(0, 0, 0, 0.0) });
+        p.bordear(r, alto / 2.0, if sobre { tema::BORDE_FUERTE } else { tema::BORDE }, 1.0);
+        let c = if sobre { tema::TEXTO } else { tema::TEXTO_2 };
+        p.glifo(glifo::MAS, r.left + 18.0, cy + alto / 2.0, 10.0, c);
+        p.texto("Grupo", rect(r.left + 30.0, cy, w - 38.0, alto), 12.5, Peso::Medio, Alin::Izq, c);
+        self.zona(r, Accion::NuevoGrupo);
+        cy + alto + 12.0
+    }
+
+    /// Ícono, nombre, orden y borrar del grupo que se está editando.
+    fn barra_grupo(&mut self, p: &mut Pintor, x: f32, y: f32, ancho: f32) -> f32 {
+        let Some(g) = self.grupo.filter(|&g| g < self.cfg.grupos.len()) else { return y };
+        let alto = 34.0;
+        // Ícono: clic para elegir otro.
+        let caja = rect(x, y, alto, alto);
+        let sobre = self.hover == Some(Accion::IconoGrupo);
+        p.rellenar(caja, 8.0, if sobre { tema::CONTROL_ACTIVO } else { rgba(0, 0, 0, 0.25) });
+        p.bordear(caja, 8.0, if sobre { tema::BORDE_FUERTE } else { tema::BORDE }, 1.0);
+        let visual = self.cfg.grupos[g].icono.as_deref().and_then(icons::visual_propio);
+        match visual {
+            Some(v) => p.visual(&v, rect(x + 7.0, y + 7.0, 20.0, 20.0), tema::TEXTO),
+            None => {
+                if let Some(n) = lucide::nombre("folder") {
+                    p.lucide(n, rect(x + 8.0, y + 8.0, 18.0, 18.0), tema::TEXTO_2);
+                }
+            }
+        }
+        self.zona(caja, Accion::IconoGrupo);
+
+        let confirmar = self.confirmar_quitar;
+        let ancho_botones = if confirmar { 64.0 + 112.0 } else { 100.0 };
+        self.campo_texto(p, rect(x + alto + 8.0, y, ancho - alto - 8.0 - ancho_botones, alto), CampoId::NombreGrupo, "Nombre del grupo", None);
+        let cy = y + alto / 2.0;
+        let derecha = x + ancho;
+        if confirmar {
+            self.icono_boton(p, derecha - 112.0 - 46.0, cy, glifo::IZQUIERDA, Accion::GrupoIzquierda, false);
+            self.icono_boton(p, derecha - 112.0 - 14.0, cy, glifo::DERECHA, Accion::GrupoDerecha, false);
+            let r = rect(derecha - 104.0, y + 2.0, 104.0, alto - 4.0);
+            let sobre = self.hover == Some(Accion::QuitarGrupo);
+            p.rellenar(r, 8.0, if sobre { tema::PELIGRO } else { rgba(0, 0, 0, 0.25) });
+            p.bordear(r, 8.0, tema::PELIGRO, 1.0);
+            p.texto("¿Quitar grupo?", r, 12.0, Peso::Semi, Alin::Centro, if sobre { tema::TEXTO_OSCURO } else { tema::PELIGRO });
+            self.zona(r, Accion::QuitarGrupo);
+        } else {
+            self.icono_boton(p, derecha - 82.0, cy, glifo::IZQUIERDA, Accion::GrupoIzquierda, false);
+            self.icono_boton(p, derecha - 50.0, cy, glifo::DERECHA, Accion::GrupoDerecha, false);
+            self.icono_boton(p, derecha - 16.0, cy, glifo::BORRAR, Accion::QuitarGrupo, true);
+        }
+        y + alto + 12.0
+    }
+
     /// Panel para elegir un ícono: los de Lucide o los que trae un archivo.
     fn selector_ui(&mut self, p: &mut Pintor, w: f32, h: f32) {
         let Some(modo) = self.selector else { return };
@@ -1191,6 +1436,10 @@ impl Ajustes {
             ("Archivo", Accion::ModoSelector(ModoSel::Archivo), modo == ModoSel::Archivo),
         ]);
 
+        let actual = self.icono_objetivo();
+        if actual.is_some() {
+            self.boton(p, rect(x0 + 150.0, panel.top + 15.0, 110.0, 32.0), "Automático", None, false, Accion::IconoAuto);
+        }
         let y = panel.top + 62.0;
         let total = match modo {
             ModoSel::Lucide => {
@@ -1240,10 +1489,10 @@ impl Ajustes {
                     ModoSel::Lucide => {
                         let i = self.lucide_filtrados[k];
                         let n = lucide::nombre_en(i);
-                        (Accion::ElegirLucide(i), self.icono_editor.as_deref() == Some(format!("lucide:{n}").as_str()))
+                        (Accion::ElegirLucide(i), actual.as_deref() == Some(format!("lucide:{n}").as_str()))
                     }
                     ModoSel::Archivo => {
-                        (Accion::ElegirArchivo(k as i32), self.icono_editor.as_deref() == Some(format!("archivo:{ruta},{k}").as_str()))
+                        (Accion::ElegirArchivo(k as i32), actual.as_deref() == Some(format!("archivo:{ruta},{k}").as_str()))
                     }
                 };
                 let sobre = self.hover == Some(accion);
@@ -1303,14 +1552,23 @@ impl Ajustes {
         let (cy, sig) = self.fila(p, x, y, cw, "Versión", "Lanzador radial para Windows, en Rust nativo.");
         p.texto(env!("CARGO_PKG_VERSION"), rect(x + cw - 216.0, cy - 12.0, 200.0, 24.0), 13.0, Peso::Semi, Alin::Der, tema::TEXTO);
         y = sig;
+        y += 14.0;
+        y = self.cabecera(p, x, y, cw, "Archivos");
         let ruta = config::ruta().display().to_string();
-        let (cy, sig) = self.fila(p, x, y, cw, "Archivo de configuración", &ruta);
+        let (cy, sig) = self.fila(p, x, y, cw, "config.json", &ruta);
         self.boton(p, rect(x + cw - 16.0 - 220.0, cy - 16.0, 100.0, 32.0), "Abrir", None, false, Accion::AbrirConfig);
         self.boton(p, rect(x + cw - 16.0 - 110.0, cy - 16.0, 110.0, 32.0), "Carpeta", Some(glifo::CARPETA), false, Accion::AbrirCarpeta);
+        y = sig;
+        let (cy, sig) = self.fila(p, x, y, cw, "Salir de Focus", "Quita el ícono de la bandeja y deja de escuchar el botón.");
+        self.boton(p, rect(x + cw - 16.0 - 110.0, cy - 16.0, 110.0, 32.0), "Salir", Some(glifo::CERRAR), false, Accion::Salir);
         y = sig + 14.0;
         y = self.cabecera(p, x, y, cw, "Cómo se usa");
-        let texto = "Mantén pulsado el botón configurado en cualquier sitio, apunta hacia un acceso y suelta. \
-                     Suelta en el centro o pulsa Escape para cancelar. Un clic corto funciona como siempre.";
+        let texto = match self.cfg.modo {
+            Modo::Soltar => "Mantén pulsado el botón configurado, apunta a un grupo hasta que se abra, apunta a una app y suelta. \
+                             En el centro se vuelve atrás o se cancela; Escape también cancela. Un clic corto funciona como siempre.",
+            Modo::Clic => "Mantén pulsado el botón configurado hasta que salga la rueda y suéltalo. Con clic izquierdo abres un \
+                           grupo y luego una app; el clic derecho o el centro vuelven atrás o cierran. Escape también cierra.",
+        };
         p.parrafo(texto, rect(x, y, cw.min(640.0), 80.0), 13.0, tema::TEXTO_2);
     }
 
@@ -1388,6 +1646,7 @@ impl Ajustes {
                     }
                 }
                 CampoId::Archivo => self.cargar_archivo(),
+                CampoId::NombreGrupo => self.foco = None,
                 _ => self.guardar_formulario(),
             },
             0x1B => self.foco = None,
@@ -1425,6 +1684,14 @@ impl Ajustes {
                 self.scroll_sel = 0.0;
             }
             CampoId::Archivo => self.cargar_archivo(),
+            CampoId::NombreGrupo => {
+                // El nombre del grupo se guarda mientras se escribe.
+                let nombre = self.campos[id as usize].texto.trim().to_string();
+                if let Some(g) = self.grupo.filter(|&g| g < self.cfg.grupos.len()) {
+                    self.cfg.grupos[g].nombre = nombre;
+                    self.guardar();
+                }
+            }
             _ => {}
         }
     }
