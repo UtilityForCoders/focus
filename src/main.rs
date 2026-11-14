@@ -67,6 +67,8 @@ struct Rueda {
     seleccion: Option<usize>,
     inicio: Instant,
     progreso: f32,
+    /// Progreso visible antes de abrir un grupo por permanencia.
+    progreso_grupo: f32,
     /// Grupo abierto; `None` en la rueda principal.
     nivel: Option<usize>,
     /// Grupo al que se está apuntando en la raíz, y desde cuándo (para abrirlo al rato).
@@ -367,6 +369,7 @@ fn abrir(app: &mut App) {
             seleccion: None,
             inicio: Instant::now(),
             progreso: 0.0,
+            progreso_grupo: 0.0,
             nivel: None,
             apuntado: None,
             en_centro: None,
@@ -394,6 +397,7 @@ fn navegar(app: &mut App, nivel: Option<usize>) {
     r.apuntado = None;
     r.en_centro = None;
     r.seleccion = None;
+    r.progreso_grupo = 0.0;
     // La animación de apertura se repite: las baldosas del nuevo nivel salen del centro.
     r.inicio = Instant::now();
     r.progreso = 0.0;
@@ -446,6 +450,7 @@ fn actualizar(app: &mut App) {
     let seleccion = wheel::sector_en(dx, dy, n, radio_central);
     let distancia = (dx * dx + dy * dy).sqrt();
     let ahora = Instant::now();
+    let mut progreso_grupo = 0.0;
 
     // Navegación entre niveles.
     let mut cambio: Option<Option<usize>> = None;
@@ -460,6 +465,7 @@ fn actualizar(app: &mut App) {
                         ahora
                     }
                 };
+                progreso_grupo = (ahora.duration_since(desde).as_millis() as f32 / ESPERA_GRUPO_MS as f32).min(1.0);
                 // Exige una dirección estable. Alejar el puntero no confirma por sí solo: ese
                 // atajo abría grupos accidentalmente durante movimientos rápidos.
                 if ahora.duration_since(desde).as_millis() >= ESPERA_GRUPO_MS {
@@ -488,9 +494,10 @@ fn actualizar(app: &mut App) {
     let t = (r.inicio.elapsed().as_secs_f32() * 1000.0 / APERTURA_MS).min(1.0);
     let progreso = 1.0 - (1.0 - t).powi(3); // ease-out cúbico
 
-    if seleccion != r.seleccion || progreso != r.progreso {
+    if seleccion != r.seleccion || progreso != r.progreso || progreso_grupo != r.progreso_grupo {
         r.seleccion = seleccion;
         r.progreso = progreso;
+        r.progreso_grupo = progreso_grupo;
         pintar(app);
     }
 }
@@ -514,6 +521,7 @@ fn pintar(app: &mut App) {
         grupo,
         seleccion: r.seleccion,
         progreso: r.progreso,
+        progreso_grupo: r.progreso_grupo,
         oscurecer: app.cfg.oscurecer,
         radio_central: app.cfg.zona_central * r.escala,
         mostrar_nombres: app.cfg.mostrar_nombres,

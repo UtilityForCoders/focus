@@ -1137,7 +1137,7 @@ impl Ajustes {
     fn apariencia(&mut self, p: &mut Pintor, x: f32, cw: f32, h: f32) {
         let mut y = self.titulo(p, x, cw, "Apariencia", "");
         y = self.cabecera(p, x, y, cw, "Rueda");
-        let (cy, sig) = self.fila(p, x, y, cw, "Tamaño", "Escala de las baldosas y del círculo.");
+        let (cy, sig) = self.fila(p, x, y, cw, "Tamaño", "Escala de los botones orbitales y del centro.");
         let v = (self.cfg.tamano - config::TAMANO_MIN) / (config::TAMANO_MAX - config::TAMANO_MIN);
         let texto = format!("{} %", (self.cfg.tamano * 100.0).round() as i32);
         self.deslizador(p, x + cw - 16.0, cy, Desliz::Tamano, v, &texto);
@@ -1150,7 +1150,7 @@ impl Ajustes {
         let mn = self.cfg.mostrar_nombres;
         self.interruptor(p, x + cw - 16.0, cy, mn, Accion::MostrarNombres);
         y = sig;
-        let (cy, sig) = self.fila(p, x, y, cw, "Opacidad del fondo", "Nivel de transparencia del fondo de los segmentos.");
+        let (cy, sig) = self.fila(p, x, y, cw, "Opacidad de los botones", "Nivel de transparencia de los botones orbitales.");
         let v_op = (self.cfg.opacidad_fondo - config::OPACIDAD_MIN) / (config::OPACIDAD_MAX - config::OPACIDAD_MIN);
         let texto_op = format!("{} %", (self.cfg.opacidad_fondo * 100.0).round() as i32);
         self.deslizador(p, x + cw - 16.0, cy, Desliz::OpacidadFondo, v_op, &texto_op);
@@ -1173,6 +1173,7 @@ impl Ajustes {
             grupo: None,
             seleccion: (!baldosas.is_empty()).then_some(0),
             progreso: 1.0,
+            progreso_grupo: 0.45,
             oscurecer: false,
             radio_central: self.cfg.zona_central * self.cfg.tamano * ajuste,
             mostrar_nombres: self.cfg.mostrar_nombres,

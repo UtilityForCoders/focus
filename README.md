@@ -66,7 +66,7 @@ Cada cambio se guarda al momento y vale desde la siguiente pulsación.
 ### Grupos
 
 La rueda principal solo muestra grupos (por ejemplo *Multimedia* con Twitch, YouTube y Kick, o
-*Agentes de IA* con Claude y ChatGPT), como baldosas apiladas. Sin ícono propio, un grupo
+*Agentes de IA* con Claude y ChatGPT), como botones distribuidos sobre una órbita. Sin ícono propio, un grupo
 muestra en miniatura los de sus primeros cuatro accesos. Al abrir uno, la rueda se vuelve a
 desplegar con sus apps y su nombre bajo el botón central.
 
@@ -80,7 +80,7 @@ En **Activación → Elegir con** hay dos modos:
 | Volver | Quédate un instante en el centro (muestra una flecha) | Clic derecho, o clic en el centro |
 | Cerrar | Suelta en el centro o pulsa **Escape** | Clic derecho o en el centro (en la rueda principal), **Escape** o el botón otra vez |
 
-Como en todo Orbyt, cuenta la dirección del puntero, no hace falta acertar encima de la baldosa.
+Como en todo Orbyt, cuenta la dirección del puntero, no hace falta acertar encima del botón.
 En modo clic, los clics con la rueda abierta son para Orbyt y no llegan a la ventana de debajo.
 
 ### Íconos
@@ -153,7 +153,7 @@ puede editar a mano: se crea con ejemplos la primera vez y se relee en cada puls
 | `main.rs` | Ventana de la rueda, bucle de mensajes, abrir/cerrar, grupos y animación |
 | `hook.rs` | Ganchos globales `WH_MOUSE_LL` / `WH_KEYBOARD_LL`, botón configurable |
 | `wheel.rs` | Geometría: qué sector cae bajo el puntero |
-| `render.rs` | La rueda de baldosas, sobre una ventana layered (y en la vista previa) |
+| `render.rs` | La rueda de botones orbitales, sobre una ventana layered (y en la vista previa) |
 | `settings.rs` | Ventana de ajustes: barra lateral, secciones, listas y campos de texto propios |
 | `ui.rs` | Kit de dibujo compartido: tema oscuro, formas, texto, glifos de Segoe Fluent Icons |
 | `autostart.rs` | Iniciar con Windows (clave `Run` del usuario) |
