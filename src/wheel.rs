@@ -124,4 +124,21 @@ mod tests {
         assert!(radio_ext(4) > radio_ext(6));
         assert_eq!(radio_int(4), RADIO_INTERIOR);
     }
+
+    #[test]
+    fn distribucion_dinamica_de_2_a_8_accesos() {
+        for n in 2..=8 {
+            let mut prev_fin = -PI - 1.0;
+            for i in 0..n {
+                let (ini, fin) = angulos_sector(i, n);
+                assert!(ini < fin, "Para n={n}, sector {i}: ini ({ini}) debe ser menor que fin ({fin})");
+                let ang_centro = (ini + fin) / 2.0;
+                let (x, y) = punto_arco(100.0, ang_centro);
+                let hit = sector_en(x, y, n, ZONA);
+                assert_eq!(hit, Some(i), "Para n={n}, apuntar al centro del sector {i} debe seleccionarlo");
+                assert!(ini >= prev_fin || i == 0, "No debe haber superposición entre sectores contiguos");
+                prev_fin = fin;
+            }
+        }
+    }
 }
