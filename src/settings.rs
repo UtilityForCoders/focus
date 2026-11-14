@@ -105,6 +105,7 @@ enum Desliz {
     Retardo,
     Tamano,
     Zona,
+    OpacidadFondo,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -116,6 +117,7 @@ enum Accion {
     Deslizador(Desliz),
     InicioWindows,
     Oscurecer,
+    MostrarNombres,
     Campo(CampoId),
     AgregarApp(usize),
     Elegir(usize),
@@ -649,6 +651,10 @@ impl Ajustes {
             Desliz::Zona => {
                 self.cfg.zona_central = (config::ZONA_MIN + v * (config::ZONA_MAX - config::ZONA_MIN)).round();
             }
+            Desliz::OpacidadFondo => {
+                let op = config::OPACIDAD_MIN + v * (config::OPACIDAD_MAX - config::OPACIDAD_MIN);
+                self.cfg.opacidad_fondo = (op * 100.0).round() / 100.0;
+            }
         }
     }
 
@@ -681,6 +687,10 @@ impl Ajustes {
             }
             Accion::Oscurecer => {
                 self.cfg.oscurecer = !self.cfg.oscurecer;
+                self.guardar();
+            }
+            Accion::MostrarNombres => {
+                self.cfg.mostrar_nombres = !self.cfg.mostrar_nombres;
                 self.guardar();
             }
             Accion::AgregarApp(i) => self.agregar_app(i),
@@ -1135,6 +1145,15 @@ impl Ajustes {
         let (cy, sig) = self.fila(p, x, y, cw, "Oscurecer el fondo", "Atenúa un poco la pantalla mientras la rueda está abierta.");
         let o = self.cfg.oscurecer;
         self.interruptor(p, x + cw - 16.0, cy, o, Accion::Oscurecer);
+        y = sig;
+        let (cy, sig) = self.fila(p, x, y, cw, "Mostrar nombres en la rueda", "Muestra los nombres de los accesos dentro de la rueda.");
+        let mn = self.cfg.mostrar_nombres;
+        self.interruptor(p, x + cw - 16.0, cy, mn, Accion::MostrarNombres);
+        y = sig;
+        let (cy, sig) = self.fila(p, x, y, cw, "Opacidad del fondo", "Nivel de transparencia del fondo de los segmentos.");
+        let v_op = (self.cfg.opacidad_fondo - config::OPACIDAD_MIN) / (config::OPACIDAD_MAX - config::OPACIDAD_MIN);
+        let texto_op = format!("{} %", (self.cfg.opacidad_fondo * 100.0).round() as i32);
+        self.deslizador(p, x + cw - 16.0, cy, Desliz::OpacidadFondo, v_op, &texto_op);
         y = sig + 14.0;
 
         // Vista previa en vivo, con los accesos y el tamaño actuales.
@@ -1156,6 +1175,9 @@ impl Ajustes {
             progreso: 1.0,
             oscurecer: false,
             radio_central: self.cfg.zona_central * self.cfg.tamano * ajuste,
+            mostrar_nombres: self.cfg.mostrar_nombres,
+            color_hover: self.cfg.color_hover,
+            opacidad_fondo: self.cfg.opacidad_fondo,
         };
         p.recortar(caja);
         render::pintar_rueda(p, &escena);
