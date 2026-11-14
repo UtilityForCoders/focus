@@ -337,28 +337,22 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
         let r_ext = if activa { r_ext_base + 5.0 * s } else { r_ext_base };
         let b = &e.baldosas[i];
 
-        if b.es_grupo() {
-            let _ = dibujar_segmento(&factory, p, cx, cy, ang_ini, ang_fin, r_int + 3.0 * s, r_ext + 4.0 * s, col_fondo, SEGMENTO_BORDE, s);
-        }
-
         let relleno = if activa { col_hover } else { col_fondo };
         let borde = if activa { SEGMENTO_BORDE_HOVER } else { SEGMENTO_BORDE };
         let _ = dibujar_segmento(&factory, p, cx, cy, ang_ini, ang_fin, r_int, r_ext, relleno, borde, s);
 
         let r_medio = (r_int + r_ext) / 2.0;
+        let (px, py) = (cx + r_medio * ang_centro.cos(), cy + r_medio * ang_centro.sin());
         let (ix, iy, lado) = if e.mostrar_nombres {
-            let r_ico = r_medio - 6.0 * s;
-            let (ix, iy) = (cx + r_ico * ang_centro.cos(), cy + r_ico * ang_centro.sin());
-            let r_txt = r_medio + 14.0 * s;
-            let (tx, ty) = (cx + r_txt * ang_centro.cos(), cy + r_txt * ang_centro.sin());
-            let w_txt = ((r_ext - r_int) * 0.95).min(72.0 * s);
+            let (ix, iy) = (px, py - 8.0 * s);
+            let (tx, ty) = (px, py + 10.0 * s);
+            let w_txt = ((r_ext - r_int) * 0.95).min(76.0 * s);
             let h_txt = 14.0 * s;
             let caja_txt = rect(tx - w_txt / 2.0, ty - h_txt / 2.0, w_txt, h_txt);
             p.texto(&b.nombre, caja_txt, 10.0 * s, Peso::Medio, Alin::Centro, tema::TEXTO);
             (ix, iy, (r_ext - r_int) * 0.38 * if activa { 1.08 } else { 1.0 })
         } else {
-            let (ix, iy) = (cx + r_medio * ang_centro.cos(), cy + r_medio * ang_centro.sin());
-            (ix, iy, (r_ext - r_int) * 0.50 * if activa { 1.10 } else { 1.0 })
+            (px, py, (r_ext - r_int) * 0.48 * if activa { 1.08 } else { 1.0 })
         };
 
         match (&b.visual, &b.grupo) {

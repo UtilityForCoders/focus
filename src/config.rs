@@ -132,7 +132,7 @@ fn si() -> bool {
 }
 
 fn mostrar_nombres_defecto() -> bool {
-    true
+    false
 }
 
 fn opacidad_fondo_defecto() -> f32 {
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(cfg.tamano, 1.0);
         assert!(cfg.grupos.is_empty());
         assert_eq!(cfg.modo, Modo::Soltar);
-        assert_eq!(cfg.mostrar_nombres, true);
+        assert_eq!(cfg.mostrar_nombres, false);
         assert_eq!(cfg.opacidad_fondo, 0.88);
         assert_eq!(cfg.color_hover, [72, 64, 96]);
     }
