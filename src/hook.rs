@@ -15,12 +15,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Mensajes que el gancho envía a la ventana principal.
-pub const WM_FOCUS_DOWN: u32 = WM_APP + 1;
-pub const WM_FOCUS_TAP: u32 = WM_APP + 2;
-pub const WM_FOCUS_RELEASE: u32 = WM_APP + 3;
-pub const WM_FOCUS_CANCEL: u32 = WM_APP + 4;
+pub const WM_ORBYT_DOWN: u32 = WM_APP + 1;
+pub const WM_ORBYT_TAP: u32 = WM_APP + 2;
+pub const WM_ORBYT_RELEASE: u32 = WM_APP + 3;
+pub const WM_ORBYT_CANCEL: u32 = WM_APP + 4;
 /// En modo clic, un clic con la rueda abierta. `lparam` es 0 si es el izquierdo, 1 el derecho.
-pub const WM_FOCUS_CLIC: u32 = WM_APP + 5;
+pub const WM_ORBYT_CLIC: u32 = WM_APP + 5;
 
 /// Sin nada en curso.
 pub const INACTIVO: u8 = 0;
@@ -133,7 +133,7 @@ fn es_el_boton(msg: u32, datos: u32) -> Option<bool> {
 unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        // Los eventos inyectados (incluido el clic que Focus reenvía) pasan sin tocar.
+        // Los eventos inyectados (incluido el clic que Orbyt reenvía) pasan sin tocar.
         let inyectado = info.flags & LLMHF_INJECTED != 0;
         if !inyectado {
             let msg = wparam.0 as u32;
@@ -145,7 +145,7 @@ unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                         .compare_exchange(INACTIVO, PENDIENTE, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
-                        avisar(WM_FOCUS_DOWN, empaquetar(info.pt.x, info.pt.y));
+                        avisar(WM_ORBYT_DOWN, empaquetar(info.pt.x, info.pt.y));
                         return LRESULT(1);
                     }
                     // Modo clic, con la rueda abierta: volver a pulsar el botón la cierra.
@@ -153,7 +153,7 @@ unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                         .compare_exchange(ABIERTA, CANCELADA, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
-                        avisar(WM_FOCUS_CANCEL, 0);
+                        avisar(WM_ORBYT_CANCEL, 0);
                         return LRESULT(1);
                     }
                 }
@@ -162,14 +162,14 @@ unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                     match ESTADO.load(Ordering::SeqCst) {
                         PENDIENTE => {
                             ESTADO.store(INACTIVO, Ordering::SeqCst);
-                            avisar(WM_FOCUS_TAP, 0);
+                            avisar(WM_ORBYT_TAP, 0);
                             return LRESULT(1);
                         }
                         // En modo clic, soltar no elige nada: la rueda queda abierta.
                         ABIERTA if clic => return LRESULT(1),
                         ABIERTA => {
                             ESTADO.store(INACTIVO, Ordering::SeqCst);
-                            avisar(WM_FOCUS_RELEASE, 0);
+                            avisar(WM_ORBYT_RELEASE, 0);
                             return LRESULT(1);
                         }
                         CANCELADA => {
@@ -186,12 +186,12 @@ unsafe extern "system" fn raton(code: i32, wparam: WPARAM, lparam: LPARAM) -> LR
                         match msg {
                             WM_LBUTTONDOWN => {
                                 TRAGAR_IZQ.store(true, Ordering::SeqCst);
-                                avisar(WM_FOCUS_CLIC, 0);
+                                avisar(WM_ORBYT_CLIC, 0);
                                 return LRESULT(1);
                             }
                             WM_RBUTTONDOWN => {
                                 TRAGAR_DER.store(true, Ordering::SeqCst);
-                                avisar(WM_FOCUS_CLIC, 1);
+                                avisar(WM_ORBYT_CLIC, 1);
                                 return LRESULT(1);
                             }
                             _ => {}
@@ -221,7 +221,7 @@ unsafe extern "system" fn teclado(code: i32, wparam: WPARAM, lparam: LPARAM) -> 
                 // Con el botón aún pulsado queda CANCELADA (falta tragar su liberación); en modo
                 // clic, ya suelto, vuelve directamente a INACTIVO.
                 terminar();
-                avisar(WM_FOCUS_CANCEL, 0);
+                avisar(WM_ORBYT_CANCEL, 0);
             }
             // Escape no llega a la ventana de debajo mientras la rueda está abierta.
             return LRESULT(1);

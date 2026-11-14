@@ -5,7 +5,7 @@
 //! Es una ventana emergente propia: se abre junto al puntero, resalta la opción bajo el ratón,
 //! se maneja también con el teclado (flechas, Enter, Escape) y se cierra sola al perder el foco o
 //! al hacer clic fuera, como un menú normal. Al elegir una opción avisa a la ventana principal
-//! con `WM_FOCUS_MENU`.
+//! con `WM_ORBYT_MENU`.
 
 use crate::ui::{glifo, rect, rgba, tema, Alin, Peso, Pintor};
 use std::cell::RefCell;
@@ -24,14 +24,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Se eligió una opción; `wparam` es el comando.
-pub const WM_FOCUS_MENU: u32 = WM_APP + 50;
+pub const WM_ORBYT_MENU: u32 = WM_APP + 50;
 pub const CMD_CONFIGURAR: usize = 1;
 pub const CMD_SALIR: usize = 2;
 
 /// Opciones del menú: comando, glifo y texto.
 const OPCIONES: [(usize, char, &str); 2] = [
     (CMD_CONFIGURAR, glifo::AJUSTES, "Configuración"),
-    (CMD_SALIR, glifo::APAGAR, "Salir de Focus"),
+    (CMD_SALIR, glifo::APAGAR, "Salir de Orbyt"),
 ];
 /// Antes de esta opción va una línea separadora.
 const SEPARAR_ANTES: usize = 1;
@@ -98,7 +98,7 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
             style: CS_DROPSHADOW,
             lpfnWndProc: Some(wndproc),
             hInstance: instancia,
-            lpszClassName: w!("FocusMenu"),
+            lpszClassName: w!("OrbytMenu"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
@@ -122,8 +122,8 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
 
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            w!("FocusMenu"),
-            w!("Focus"),
+            w!("OrbytMenu"),
+            w!("Orbyt"),
             WS_POPUP,
             x,
             y,
@@ -242,7 +242,7 @@ impl Menu {
 /// Elige una opción: avisa a la ventana principal y cierra el menú.
 fn elegir(hwnd: HWND, principal: HWND, i: usize) {
     unsafe {
-        let _ = PostMessageW(Some(principal), WM_FOCUS_MENU, WPARAM(OPCIONES[i].0), LPARAM(0));
+        let _ = PostMessageW(Some(principal), WM_ORBYT_MENU, WPARAM(OPCIONES[i].0), LPARAM(0));
         let _ = DestroyWindow(hwnd);
     }
 }

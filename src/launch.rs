@@ -10,7 +10,7 @@ pub fn abrir(acceso: &Acceso) {
     let destino = HSTRING::from(expandir(acceso.destino.trim()));
     let argumentos = acceso.argumentos.as_deref().map(|a| HSTRING::from(expandir(a)));
     unsafe {
-        // Focus nunca toma el foco (la rueda no se activa), así que Windows no dejaría que la
+        // Orbyt nunca toma el foco (la rueda no se activa), así que Windows no dejaría que la
         // ventana nueva pase al frente. Esto le cede el permiso al proceso que se abre.
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         let resultado = ShellExecuteW(

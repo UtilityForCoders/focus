@@ -48,7 +48,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Avisa a la ventana principal de que la configuración cambió (para precargar íconos).
-pub const WM_FOCUS_CONFIG: u32 = WM_APP + 20;
+pub const WM_ORBYT_CONFIG: u32 = WM_APP + 20;
 const WM_APPS_LISTA: u32 = WM_APP + 30;
 const WM_APPS_ICONOS: u32 = WM_APP + 31;
 const TIMER_CURSOR: usize = 1;
@@ -327,7 +327,7 @@ pub fn abrir(principal: HWND) {
     }
 }
 
-/// Cierra la ventana si está abierta (al salir de Focus).
+/// Cierra la ventana si está abierta (al salir de Orbyt).
 pub fn cerrar() {
     let v = VENTANA.load(Ordering::Relaxed);
     if v != 0 {
@@ -349,7 +349,7 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: instancia,
-            lpszClassName: w!("FocusAjustes"),
+            lpszClassName: w!("OrbytAjustes"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hIcon: LoadIconW(None, IDI_APPLICATION)?,
             ..Default::default()
@@ -371,8 +371,8 @@ fn crear(principal: HWND) -> windows::core::Result<()> {
 
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("FocusAjustes"),
-            w!("Focus"),
+            w!("OrbytAjustes"),
+            w!("Orbyt"),
             WS_OVERLAPPEDWINDOW,
             x,
             y,
@@ -472,7 +472,7 @@ impl Ajustes {
             eprintln!("no se pudo guardar config.json: {e}");
         }
         unsafe {
-            let _ = PostMessageW(Some(self.principal), WM_FOCUS_CONFIG, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(self.principal), WM_ORBYT_CONFIG, WPARAM(0), LPARAM(0));
         }
     }
 
@@ -927,7 +927,7 @@ impl Ajustes {
             self.zona(r, Accion::Seccion(s));
             y += 40.0;
         }
-        let version = format!("Focus {}", env!("CARGO_PKG_VERSION"));
+        let version = format!("Orbyt {}", env!("CARGO_PKG_VERSION"));
         p.texto(&version, rect(22.0, h - 40.0, 170.0, 24.0), 11.5, Peso::Normal, Alin::Izq, tema::TEXTO_3);
     }
 
@@ -1097,7 +1097,7 @@ impl Ajustes {
         self.deslizador(p, x + cw - 16.0, cy, Desliz::Retardo, v, &texto);
         y = sig + 14.0;
         y = self.cabecera(p, x, y, cw, "Sistema");
-        let (cy, _) = self.fila(p, x, y, cw, "Iniciar con Windows", "Focus se abre solo al iniciar sesión y queda en la bandeja.");
+        let (cy, _) = self.fila(p, x, y, cw, "Iniciar con Windows", "Orbyt se abre solo al iniciar sesión y queda en la bandeja.");
         let activo = self.inicio_windows;
         self.interruptor(p, x + cw - 16.0, cy, activo, Accion::InicioWindows);
     }
@@ -1581,7 +1581,7 @@ impl Ajustes {
         self.boton(p, rect(x + cw - 16.0 - 220.0, cy - 16.0, 100.0, 32.0), "Abrir", None, false, Accion::AbrirConfig);
         self.boton(p, rect(x + cw - 16.0 - 110.0, cy - 16.0, 110.0, 32.0), "Carpeta", Some(glifo::CARPETA), false, Accion::AbrirCarpeta);
         y = sig;
-        let (cy, sig) = self.fila(p, x, y, cw, "Salir de Focus", "Quita el ícono de la bandeja y deja de escuchar el botón.");
+        let (cy, sig) = self.fila(p, x, y, cw, "Salir de Orbyt", "Quita el ícono de la bandeja y deja de escuchar el botón.");
         self.boton(p, rect(x + cw - 16.0 - 110.0, cy - 16.0, 110.0, 32.0), "Salir", Some(glifo::CERRAR), false, Accion::Salir);
         y = sig + 14.0;
         y = self.cabecera(p, x, y, cw, "Cómo se usa");

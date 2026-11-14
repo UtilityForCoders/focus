@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 /// Toca pintar un fotograma.
-pub const WM_FOCUS_FOTOGRAMA: u32 = WM_APP + 6;
+pub const WM_ORBYT_FOTOGRAMA: u32 = WM_APP + 6;
 
 static ACTIVO: AtomicBool = AtomicBool::new(false);
 /// Hay un aviso en la cola sin atender: no se manda otro hasta que se atienda, para que un hilo
@@ -24,7 +24,7 @@ static EN_COLA: AtomicBool = AtomicBool::new(false);
 static VENTANA: AtomicIsize = AtomicIsize::new(0);
 static HILO: OnceLock<Thread> = OnceLock::new();
 
-/// Empieza a mandar `WM_FOCUS_FOTOGRAMA` a `hwnd` en cada refresco de pantalla.
+/// Empieza a mandar `WM_ORBYT_FOTOGRAMA` a `hwnd` en cada refresco de pantalla.
 pub fn empezar(hwnd: HWND) {
     VENTANA.store(hwnd.0 as isize, Ordering::SeqCst);
     EN_COLA.store(false, Ordering::SeqCst);
@@ -38,7 +38,7 @@ pub fn parar() {
     ACTIVO.store(false, Ordering::SeqCst);
 }
 
-/// Llamar al atender `WM_FOCUS_FOTOGRAMA`, antes de pintar.
+/// Llamar al atender `WM_ORBYT_FOTOGRAMA`, antes de pintar.
 pub fn atendido() {
     EN_COLA.store(false, Ordering::SeqCst);
 }
@@ -54,7 +54,7 @@ fn bucle() {
         }
         if ACTIVO.load(Ordering::SeqCst) && !EN_COLA.swap(true, Ordering::SeqCst) {
             let hwnd = HWND(VENTANA.load(Ordering::SeqCst) as *mut _);
-            if unsafe { PostMessageW(Some(hwnd), WM_FOCUS_FOTOGRAMA, WPARAM(0), LPARAM(0)) }.is_err() {
+            if unsafe { PostMessageW(Some(hwnd), WM_ORBYT_FOTOGRAMA, WPARAM(0), LPARAM(0)) }.is_err() {
                 EN_COLA.store(false, Ordering::SeqCst);
             }
         }

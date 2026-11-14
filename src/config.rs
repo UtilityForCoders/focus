@@ -1,4 +1,4 @@
-//! Configuración en `%APPDATA%\Focus\config.json`.
+//! Configuración en `%APPDATA%\Orbyt\config.json`.
 //!
 //! Si el archivo no existe se crea con unos accesos de ejemplo, para que la rueda tenga algo que
 //! mostrar la primera vez. Un JSON mal escrito no tumba la app: se avisa por consola (en debug) y
@@ -238,7 +238,7 @@ impl Default for Config {
 
 pub fn ruta() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("Focus").join("config.json")
+    base.join("Orbyt").join("config.json")
 }
 
 /// Lee la configuración. Si no hay archivo, lo crea con los valores por defecto.
@@ -314,9 +314,9 @@ mod tests {
 
     #[test]
     fn expande_variables_conocidas_y_respeta_las_demas() {
-        std::env::set_var("FOCUS_PRUEBA", "C:\\x");
-        assert_eq!(expandir("%FOCUS_PRUEBA%\\y"), "C:\\x\\y");
-        assert_eq!(expandir("%NO_EXISTE_FOCUS%"), "%NO_EXISTE_FOCUS%");
+        std::env::set_var("ORBYT_PRUEBA", "C:\\x");
+        assert_eq!(expandir("%ORBYT_PRUEBA%\\y"), "C:\\x\\y");
+        assert_eq!(expandir("%NO_EXISTE_ORBYT%"), "%NO_EXISTE_ORBYT%");
         assert_eq!(expandir("100%"), "100%");
         assert_eq!(expandir("sin variables"), "sin variables");
     }

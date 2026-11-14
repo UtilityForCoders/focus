@@ -6,7 +6,7 @@ use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::*;
 
 const CLAVE: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const VALOR: PCWSTR = w!("Focus");
+const VALOR: PCWSTR = w!("Orbyt");
 
 fn comando() -> Option<String> {
     let exe = std::env::current_exe().ok()?;

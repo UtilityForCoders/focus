@@ -2,7 +2,7 @@
 //!
 //! Se descargan con WinHTTP (el cliente HTTP de Windows: sigue redirecciones, respeta el proxy
 //! del sistema y valida certificados) en un hilo aparte, nunca mientras se dibuja. La respuesta se
-//! guarda en `%APPDATA%\Focus\favicons\<host>.png`, así que cada sitio se pide una sola vez y
+//! guarda en `%APPDATA%\Orbyt\favicons\<host>.png`, así que cada sitio se pide una sola vez y
 //! después funciona sin red.
 //!
 //! **Qué sale del equipo:** solo el nombre del host (`github.com`), y solo hacia el servicio de
@@ -21,7 +21,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 /// Se envía a la ventana de aviso cuando llega un favicon nuevo.
-pub const WM_FOCUS_FAVICON: u32 = WM_APP + 40;
+pub const WM_ORBYT_FAVICON: u32 = WM_APP + 40;
 
 static AVISO: AtomicIsize = AtomicIsize::new(0);
 /// Hosts ya pedidos en esta sesión (con éxito o no): no se vuelven a pedir.
@@ -54,7 +54,7 @@ pub fn host(url: &str) -> Option<String> {
 
 fn carpeta() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("Focus").join("favicons")
+    base.join("Orbyt").join("favicons")
 }
 
 fn archivo(host: &str) -> PathBuf {
@@ -67,7 +67,7 @@ pub fn en_disco(host: &str) -> Option<Vec<u8>> {
 }
 
 /// Pide el favicon en segundo plano, una sola vez por host y sesión. Al terminar avisa con
-/// `WM_FOCUS_FAVICON` (si lo consiguió).
+/// `WM_ORBYT_FAVICON` (si lo consiguió).
 pub fn pedir(host: String) {
     {
         let Ok(mut g) = PEDIDOS.lock() else { return };
@@ -95,7 +95,7 @@ pub fn pedir(host: String) {
                 let v = AVISO.load(Ordering::Relaxed);
                 if v != 0 {
                     unsafe {
-                        let _ = PostMessageW(Some(HWND(v as *mut _)), WM_FOCUS_FAVICON, WPARAM(0), LPARAM(0));
+                        let _ = PostMessageW(Some(HWND(v as *mut _)), WM_ORBYT_FAVICON, WPARAM(0), LPARAM(0));
                     }
                 }
             }
@@ -118,7 +118,7 @@ fn descargar(servidor: &str, ruta: &str) -> Option<Vec<u8>> {
     }
     unsafe {
         let sesion = Asa(WinHttpOpen(
-            w!("Focus/1.0"),
+            w!("Orbyt/1.0"),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             PCWSTR::null(),
             PCWSTR::null(),
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn extrae_el_host_sin_ruta_usuario_ni_puerto() {
-        assert_eq!(host("https://github.com/UtilityForCoders/focus").as_deref(), Some("github.com"));
+        assert_eq!(host("https://github.com/UtilityForCoders/orbyt").as_deref(), Some("github.com"));
         assert_eq!(host("http://Example.com:8080/a?b=c").as_deref(), Some("example.com"));
         assert_eq!(host("https://user:pw@secreto.example.com/x").as_deref(), Some("secreto.example.com"));
         assert_eq!(host("HTTPS://WWW.Google.com").as_deref(), Some("www.google.com"));

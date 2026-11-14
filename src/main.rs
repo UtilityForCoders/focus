@@ -1,4 +1,4 @@
-//! Focus: lanzador radial para Windows.
+//! Orbyt: lanzador radial para Windows.
 //!
 //! Mantén pulsado el botón central del ratón (o uno lateral, según los ajustes) en cualquier
 //! sitio, apunta hacia un acceso y suelta. Un clic corto se reenvía tal cual, así que abrir
@@ -131,7 +131,7 @@ fn con_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 fn main() -> Result<()> {
     unsafe {
         // Una sola instancia: dos ganchos peleándose por el mismo botón no sirven para nada.
-        let _mutex = CreateMutexW(None, true, w!("Local\\FocusLanzadorRadial"))?;
+        let _mutex = CreateMutexW(None, true, w!("Local\\OrbytLanzadorRadial"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return Ok(());
         }
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
         let clase = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instancia,
-            lpszClassName: w!("FocusRueda"),
+            lpszClassName: w!("OrbytRueda"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
@@ -155,8 +155,8 @@ fn main() -> Result<()> {
         // la activa y el teclado llega por el gancho.
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("FocusRueda"),
-            w!("Focus"),
+            w!("OrbytRueda"),
+            w!("Orbyt"),
             WS_POPUP,
             0,
             0,
@@ -184,7 +184,7 @@ fn main() -> Result<()> {
         hook::instalar(hwnd)?;
         web::poner_aviso(hwnd);
 
-        // `focus --demo`: abre la rueda bajo el puntero durante unos segundos sin pulsar nada.
+        // `orbyt --demo`: abre la rueda bajo el puntero durante unos segundos sin pulsar nada.
         // Sirve para revisar el dibujo (el gancho ignora los clics simulados con SendInput).
         if std::env::args().any(|a| a == "--demo") {
             ESTADO.store(ABIERTA, Ordering::SeqCst);
@@ -194,7 +194,7 @@ fn main() -> Result<()> {
             });
             SetTimer(Some(hwnd), TIMER_DEMO, 4000, None);
         }
-        // `focus --ajustes`: abre la ventana de configuración al arrancar.
+        // `orbyt --ajustes`: abre la ventana de configuración al arrancar.
         if std::env::args().any(|a| a == "--ajustes") {
             settings::abrir(hwnd);
         }
@@ -214,7 +214,7 @@ fn main() -> Result<()> {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_FOCUS_DOWN => {
+        WM_ORBYT_DOWN => {
             let (x, y) = desempaquetar(lparam.0);
             con_app(|app| {
                 app.pulsado_en = POINT { x, y };
@@ -225,24 +225,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 app.recargar();
             });
         }
-        web::WM_FOCUS_FAVICON => {
+        web::WM_ORBYT_FAVICON => {
             // Llegó un favicon: se releen los íconos web en la rueda y en los ajustes.
             icons::olvidar_webs();
             con_app(App::recargar);
             settings::refrescar();
         }
-        settings::WM_FOCUS_CONFIG => {
+        settings::WM_ORBYT_CONFIG => {
             // La ventana de configuración guardó: se precargan los íconos nuevos ya, para que
             // la próxima rueda no tenga que esperar por ellos.
             con_app(App::recargar);
         }
-        WM_FOCUS_TAP => {
+        WM_ORBYT_TAP => {
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_MANTENER);
             }
             reenviar_clic(hook::boton());
         }
-        WM_FOCUS_RELEASE => {
+        WM_ORBYT_RELEASE => {
             let elegido = con_app(|app| {
                 actualizar(app);
                 // Soltar sobre un grupo que aún no se abrió no abre nada.
@@ -255,14 +255,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 launch::abrir(&acceso);
             }
         }
-        WM_FOCUS_CANCEL => {
+        WM_ORBYT_CANCEL => {
             con_app(cerrar);
         }
-        ritmo::WM_FOCUS_FOTOGRAMA => {
+        ritmo::WM_ORBYT_FOTOGRAMA => {
             ritmo::atendido();
             con_app(actualizar);
         }
-        WM_FOCUS_CLIC => {
+        WM_ORBYT_CLIC => {
             let elegido = con_app(|app| clic(app, lparam.0 == 1)).flatten();
             if let Some(acceso) = elegido {
                 launch::abrir(&acceso);
@@ -286,7 +286,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             },
             _ => {}
         },
-        tray::WM_FOCUS_TRAY => {
+        tray::WM_ORBYT_TRAY => {
             let evento = (lparam.0 as u32) & 0xFFFF;
             if evento == WM_LBUTTONUP {
                 settings::abrir(hwnd);
@@ -294,7 +294,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 menu::mostrar(hwnd);
             }
         }
-        menu::WM_FOCUS_MENU => match wparam.0 {
+        menu::WM_ORBYT_MENU => match wparam.0 {
             menu::CMD_CONFIGURAR => settings::abrir(hwnd),
             menu::CMD_SALIR => unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -314,7 +314,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     LRESULT(0)
 }
 
-/// Un clic corto no era para Focus: se devuelve al sistema como si nada (el gancho deja pasar
+/// Un clic corto no era para Orbyt: se devuelve al sistema como si nada (el gancho deja pasar
 /// los eventos inyectados).
 fn reenviar_clic(boton: Boton) {
     let evento = |flags, datos: u16| INPUT {
