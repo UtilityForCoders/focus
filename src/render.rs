@@ -361,17 +361,9 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
         let b = &e.baldosas[i];
         let r_medio = (r_int + r_ext) / 2.0;
         let (px, py) = (cx + r_medio * ang_centro.cos(), cy + r_medio * ang_centro.sin());
-        let (ix, iy, lado) = if e.mostrar_nombres {
-            let (ix, iy) = (px, py - 9.0 * s);
-            let (tx, ty) = (px, py + 12.0 * s);
-            let w_txt = ((r_ext - r_int) * 0.92).min(76.0 * s);
-            let h_txt = 14.0 * s;
-            let caja_txt = rect(tx - w_txt / 2.0, ty - h_txt / 2.0, w_txt, h_txt);
-            p.texto(&b.nombre, caja_txt, 10.0 * s, Peso::Medio, Alin::Centro, tema::TEXTO);
-            (ix, iy, 28.0 * s)
-        } else {
-            (px, py, 34.0 * s * if activa { 1.06 } else { 1.0 })
-        };
+        // Los nombres dentro de cada pétalo se solapaban y desplazaban los íconos. El ícono
+        // permanece centrado y el nombre seleccionado se dibuja en una sola etiqueta exterior.
+        let (ix, iy, lado) = (px, py, 34.0 * s * if activa { 1.06 } else { 1.0 });
 
         match (&b.visual, &b.grupo) {
             (Some(v), _) => pintar_visual(p, v, ix, iy, lado),
@@ -402,7 +394,7 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
             }
         }
 
-        if activa {
+        if activa && e.mostrar_nombres {
             etiqueta = Some((ang_centro, r_ext));
         }
     }
@@ -455,6 +447,12 @@ pub fn pintar_rueda(p: &mut Pintor, e: &Escena) {
         } else {
             (ox - ancho_e / 2.0, oy)
         };
+        // La rueda puede abrirse junto al borde del monitor. Mantener la etiqueta dentro del
+        // render target evita que los nombres laterales o largos queden recortados.
+        let tam_area = unsafe { p.rt.GetSize() };
+        let margen = 8.0 * s;
+        let x = x.clamp(margen, (tam_area.width - ancho_e - margen).max(margen));
+        let y = y.clamp(margen, (tam_area.height - alto_e - margen).max(margen));
         let caja = rect(x, y, ancho_e, alto_e);
         p.sombra(caja, alto_e / 2.0, 0.9);
         p.rellenar(caja, alto_e / 2.0, rgba(28, 32, 44, 0.95));

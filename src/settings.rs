@@ -1115,7 +1115,7 @@ impl Ajustes {
         y = sig;
         let m = self.cfg.modo;
         let desc = match m {
-            Modo::Soltar => "Apuntas y sueltas. Un grupo se abre al apuntarlo.",
+            Modo::Soltar => "Apuntas y sueltas. Un grupo se abre tras apuntarlo de forma estable.",
             Modo::Clic => "El botón abre la rueda; eliges con clic izquierdo.",
         };
         let (cy, sig) = self.fila(p, x, y, cw, "Elegir con", desc);
@@ -1146,7 +1146,7 @@ impl Ajustes {
         let o = self.cfg.oscurecer;
         self.interruptor(p, x + cw - 16.0, cy, o, Accion::Oscurecer);
         y = sig;
-        let (cy, sig) = self.fila(p, x, y, cw, "Mostrar nombres en la rueda", "Muestra los nombres de los accesos dentro de la rueda.");
+        let (cy, sig) = self.fila(p, x, y, cw, "Mostrar nombre seleccionado", "Muestra junto a la rueda el nombre del acceso al que apuntas.");
         let mn = self.cfg.mostrar_nombres;
         self.interruptor(p, x + cw - 16.0, cy, mn, Accion::MostrarNombres);
         y = sig;

@@ -75,7 +75,7 @@ En **Activación → Elegir con** hay dos modos:
 | | Soltar el botón | Clic |
 |---|---|---|
 | Abrir la rueda | Mantén el botón | Mantén el botón y suéltalo: la rueda queda abierta |
-| Abrir un grupo | Apúntalo un instante, o pasa de largo la baldosa | Clic izquierdo sobre él |
+| Abrir un grupo | Mantén la dirección estable durante 650 ms | Clic izquierdo sobre él |
 | Abrir una app | Apúntala y suelta | Clic izquierdo sobre ella |
 | Volver | Quédate un instante en el centro (muestra una flecha) | Clic derecho, o clic en el centro |
 | Cerrar | Suelta en el centro o pulsa **Escape** | Clic derecho o en el centro (en la rueda principal), **Escape** o el botón otra vez |

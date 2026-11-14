@@ -52,7 +52,7 @@ const TIMER_DEMO: usize = 3;
 /// Duración de la animación de apertura.
 const APERTURA_MS: f32 = 140.0;
 /// Cuánto hay que apuntar a un grupo para que se abra.
-const ESPERA_GRUPO_MS: u128 = 280;
+const ESPERA_GRUPO_MS: u128 = 650;
 /// Cuánto hay que quedarse en el centro, dentro de un grupo, para volver a la rueda principal.
 const ESPERA_VOLVER_MS: u128 = 300;
 
@@ -460,9 +460,9 @@ fn actualizar(app: &mut App) {
                         ahora
                     }
                 };
-                // Se abre al quedarse apuntando un momento, o al pasar de largo la baldosa.
-                let lejos = distancia > (wheel::radio_anillo(n) + wheel::BALDOSA * 0.75) * r.escala;
-                if lejos || ahora.duration_since(desde).as_millis() >= ESPERA_GRUPO_MS {
+                // Exige una dirección estable. Alejar el puntero no confirma por sí solo: ese
+                // atajo abría grupos accidentalmente durante movimientos rápidos.
+                if ahora.duration_since(desde).as_millis() >= ESPERA_GRUPO_MS {
                     cambio = Some(Some(i));
                 }
             }
